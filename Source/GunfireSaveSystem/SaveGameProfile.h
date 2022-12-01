@@ -48,4 +48,6 @@ public:
 
 	UPROPERTY(SaveGame)
 	TArray<FSaveGameAchievementProgress> AchievementProgress;
+
+	void ClearUserSettings() { UserSettings.Empty(); }
 };

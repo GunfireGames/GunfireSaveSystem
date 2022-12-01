@@ -117,6 +117,7 @@ protected:
 		Uninitialized,
 		Preloading,
 		WaitingForPreload,
+		SpawningDynamicActors,
 		Complete,
 	};
 

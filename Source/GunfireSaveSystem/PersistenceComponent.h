@@ -3,6 +3,9 @@
 #pragma once
 
 #include "Components/ActorComponent.h"
+
+#include "UObject/ObjectSaveContext.h"
+
 #include "PersistenceComponent.generated.h"
 
 //
@@ -42,7 +45,7 @@ protected:
 
 #if WITH_EDITOR
 	// Called when the owner for this component is being saved
-	virtual void PreSave(const class ITargetPlatform* TargetPlatform) override;
+	virtual void PreSave(FObjectPreSaveContext SaveContext) override;
 #endif
 
 	virtual void InitializeComponent() override;

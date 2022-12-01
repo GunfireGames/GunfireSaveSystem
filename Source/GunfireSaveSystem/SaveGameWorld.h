@@ -34,5 +34,5 @@ protected:
 	// Save data for each level in the world with persistent actors.  Containers will also
 	// be created for actors that use a save key.
 	UPROPERTY(SaveGame, BlueprintReadOnly)
-	TArray<class UPersistenceContainer*> Containers;
+	TArray<TObjectPtr<class UPersistenceContainer>> Containers;
 };

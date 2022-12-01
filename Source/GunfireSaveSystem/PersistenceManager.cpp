@@ -22,6 +22,8 @@
 #include "Serialization/MemoryReader.h"
 #include "Serialization/MemoryWriter.h"
 
+#include "Launch/Resources/Version.h"
+
 DECLARE_CYCLE_STAT(TEXT("Commit Save"), STAT_PersistenceGunfire_CommitSave, STATGROUP_Persistence);
 DECLARE_CYCLE_STAT(TEXT("Spawn Dynamic Actors"), STAT_PersistenceGunfire_SpawnDynamicActors, STATGROUP_Persistence);
 DECLARE_CYCLE_STAT(TEXT("Process Cached Loads"), STAT_PersistenceGunfire_ProcessCachedLoads, STATGROUP_Persistence);
@@ -51,7 +53,8 @@ TAutoConsoleVariable<int32> CVarPersistenceDebug(TEXT("SaveSystem.Debug"), 0, TE
 // 3: Added build number
 // 4: Added checksum (not backwards compatible)
 // 5: Optimized the persistence archive by not always writing the full path to objects
-static const int32 GUNFIRE_PERSISTENCE_VERSION = 5;
+// 6: Updated saved UE version from an int32 (UE4) to the FPackageFileVersion struct (UE5)
+static const int32 GUNFIRE_PERSISTENCE_VERSION = 6;
 
 //////////////////////////////////////////////////////////////////////////////////////////
 
@@ -127,6 +130,11 @@ UPersistenceManager::UPersistenceManager()
 	{
 		FWorldDelegates::LevelAddedToWorld.AddUObject(this, &ThisClass::OnLevelAddedToWorld);
 		FWorldDelegates::OnPreWorldInitialization.AddUObject(this, &ThisClass::OnPreWorldInitialization);
+#if (ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 1)
+		FWorldDelegates::PreLevelRemovedFromWorld.AddUObject(this, &ThisClass::OnLevelPreRemoveFromWorld);
+#else
+		FWorldDelegates::LevelPreRemoveFromWorld.AddUObject(this, &ThisClass::OnLevelPreRemoveFromWorld);
+#endif
 		FWorldDelegates::LevelRemovedFromWorld.AddUObject(this, &ThisClass::OnLevelRemovedFromWorld);
 		FWorldDelegates::OnWorldCleanup.AddUObject(this, &ThisClass::OnWorldCleanup);
 		FCoreUObjectDelegates::PreLoadMap.AddUObject(this, &ThisClass::OnPreLoadMap);
@@ -136,17 +144,16 @@ UPersistenceManager::UPersistenceManager()
 		FWorldDelegates::LevelPostLoad.AddUObject(this, &ThisClass::OnLevelPostLoad);
 		FWorldDelegates::CanLevelActorsInitialize.AddUObject(this, &ThisClass::OnCanLevelActorsInitialize);
 		FWorldDelegates::LevelActorsInitialized.AddUObject(this, &ThisClass::OnLevelActorsInitialized);
-		FWorldDelegates::LevelPreRemoveFromWorld.AddUObject(this, &ThisClass::OnLevelPreRemoveFromWorld);
 
-#if PLATFORM_XBOXONE
+#if PLATFORM_XSX
 		// On Xbox we should get the background event when the app is suspended, which is a
 		// good time to save.
 		FCoreDelegates::ApplicationWillEnterBackgroundDelegate.AddUObject(this, &ThisClass::OnSuspend);
-#elif PLATFORM_PS4
-		// PS4 doesn't have an event for when the app is suspended, so trigger a save any time
-		// it goes into the background (ie, they hit the PS button).  If they hold the PS
-		// button and pick close application from the quick menu there's nothing we can do
-		// though, they'll lose any unsaved progress.
+#elif PLATFORM_PS5
+		// PlayStation doesn't have an event for when the app is suspended, so trigger a
+		// save any time it goes into the background (ie, they hit the PS button).
+		// If they hold the PS button and pick close application from the quick menu
+		// there's nothing we can do though, they'll lose any unsaved progress.
 		FCoreDelegates::ApplicationWillDeactivateDelegate.AddUObject(this, &ThisClass::OnSuspend);
 #endif
 
@@ -157,6 +164,28 @@ UPersistenceManager::UPersistenceManager()
 		for (ULevel* Level : GetWorld()->GetLevels())
 		{
 			CachedLoads.Add(Level);
+		}
+
+		// If our save profile or game classes aren't loaded put in a high priority
+		// request for them, since we'll need them soon.
+		const UGunfireSaveSystemSettings* Settings = GetDefault<UGunfireSaveSystemSettings>();
+
+		TArray<FSoftObjectPath> SaveClasses;
+		SaveClasses.Reserve(2);
+
+		if (!Settings->SaveProfileClass.IsNull())
+		{
+			SaveClasses.Add(Settings->SaveProfileClass.ToSoftObjectPath());
+		}
+
+		if (!Settings->SaveGameClass.IsNull())
+		{
+			SaveClasses.Add(Settings->SaveGameClass.ToSoftObjectPath());
+		}
+
+		if (SaveClasses.Num() > 0)
+		{
+			UAssetManager::GetStreamableManager().RequestAsyncLoad(SaveClasses, FStreamableDelegate(), FStreamableManager::AsyncLoadHighPriority);
 		}
 
 #if WITH_EDITOR
@@ -437,7 +466,7 @@ void UPersistenceManager::CommitSave(const FString& Reason, FCommitSaveComplete 
 
 		// Only allow the server to write out save games.
 		UWorld* World = GetGameInstance()->GetWorld();
-		if (CurrentData && World != nullptr && World->IsServer())
+		if (CurrentData && World != nullptr && !World->IsNetMode(NM_Client))
 		{
 			if (CurrentSlot >= 0)
 			{
@@ -563,7 +592,6 @@ USaveGameProfile* UPersistenceManager::CreateSaveProfile()
 	TSubclassOf<USaveGameProfile> SaveProfileClass = Settings->SaveProfileClass.Get();
 
 	// If the class wasn't already loaded, do so now
-	// TODO: this could be streamed on subsystem initialize, and only load synchronously if it didn't have enough time to finish.
 	if (SaveProfileClass == nullptr && !Settings->SaveProfileClass.IsNull())
 	{
 		UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Save Profile Class not loaded during profile creation, loading it synchronously!"));
@@ -620,7 +648,7 @@ FPersistenceKey UPersistenceManager::GetActorKey(AActor* Actor) const
 
 	if (Actor)
 	{
-		if (UPersistenceComponent* Component = Cast<UPersistenceComponent>(Actor->GetComponentByClass(UPersistenceComponent::StaticClass())))
+		if (UPersistenceComponent* Component = Actor->FindComponentByClass<UPersistenceComponent>())
 		{
 			Key.ContainerKey = GetContainerKey(Component);
 			Key.PersistentID = Component->UniqueID;
@@ -745,7 +773,7 @@ UPersistenceContainer* UPersistenceManager::GetContainer(const UPersistenceCompo
 {
 	UPersistenceContainer* Container = nullptr;
 
-	if (Component->GetWorld()->IsServer())
+	if (!Component->GetWorld()->IsNetMode(NM_Client))
 	{
 		FName ContainerKey = GetContainerKey(Component);
 		if (ContainerKey == NAME_None)
@@ -754,7 +782,7 @@ UPersistenceContainer* UPersistenceManager::GetContainer(const UPersistenceCompo
 			// we can encounter timing issues in World Composition levels when a 
 			// level is rapidly toggled to be loaded and then unloaded. 
 			ULevel* NewLevel = Component->GetComponentLevel();
-			if (!Component->IsPendingKill() && NewLevel != nullptr)
+			if (IsValid(Component) && NewLevel != nullptr)
 			{
 				UE_LOG(LogGunfireSaveSystem, Warning,
 					TEXT("UPersistenceManager - Encountering level '%s', containing actor '%s', not previously hit by ULevel::OnLevelLoaded"),
@@ -790,7 +818,7 @@ void UPersistenceManager::SetComponentDestroyed(UPersistenceComponent* Component
 
 void UPersistenceManager::WriteComponent(UPersistenceComponent* Component)
 {
-	if (Component->GetWorld()->IsServer())
+	if (!Component->GetWorld()->IsNetMode(NM_Client))
 	{
 		if (ensure(!Component->SaveKey.IsNone()))
 		{
@@ -856,8 +884,8 @@ void UPersistenceManager::ToBinary(UObject* Object, TArray<uint8>& ObjectBytes)
 {
 	FMemoryWriter MemoryWriter(ObjectBytes, true);
 
-	int32 PackageFileUE4Version = GPackageFileUE4Version;
-	MemoryWriter << PackageFileUE4Version;
+	FPackageFileVersion PackageFileUEVersion = GPackageFileUEVersion;
+	MemoryWriter << PackageFileUEVersion;
 
 	FSaveGameArchive Ar(MemoryWriter);
 	Ar.WriteBaseObject(Object, ClassCache);
@@ -870,8 +898,19 @@ void UPersistenceManager::FromBinary(UObject* Object, const TArray<uint8>& Objec
 
 	FMemoryReader MemoryReader(ObjectBytes, true);
 
-	int32 SavedUE4Version;
-	MemoryReader << SavedUE4Version;
+	FPackageFileVersion PackageFileUEVersion;
+	MemoryReader << PackageFileUEVersion;
+
+	// If the UE5 version is incorrect then assume we have saved data from the deprecated
+	// UE4 version type which was just an int32. Repair the state of the reader by backing
+	// up 4 bytes before continuing.
+	if ((uint32)PackageFileUEVersion.FileVersionUE5 < (uint32)EUnrealEngineObjectUE5Version::INITIAL_VERSION ||
+		(uint32)PackageFileUEVersion.FileVersionUE5 > (uint32)EUnrealEngineObjectUE5Version::AUTOMATIC_VERSION)
+	{
+		PackageFileUEVersion.FileVersionUE5 = 0;
+		int64 FixedReaderPos = MemoryReader.Tell() - 4;
+		MemoryReader.Seek(FixedReaderPos);
+	}
 
 	FSaveGameArchive Ar(MemoryReader);
 	Ar.ReadBaseObject(Object);
@@ -900,9 +939,9 @@ void UPersistenceManager::WriteSave(USaveGame* SaveGame, TArray<uint8>& SaveBlob
 		BuildNumber = GetBuildNumber.Execute();
 	MemoryWriter << BuildNumber;
 
-	// Write out engine and UE4 version information
-	int32 PackageFileUE4Version = GPackageFileUE4Version;
-	MemoryWriter << PackageFileUE4Version;
+	// Write out engine and UE version information
+	FPackageFileVersion PackageFileUEVersion = GPackageFileUEVersion;
+	MemoryWriter << PackageFileUEVersion;
 
 	// Write the class path so we know what class to load
 	FString SaveGameClassPath = SaveGame->GetClass()->GetPathName();
@@ -980,10 +1019,21 @@ bool UPersistenceManager::InitSaveArchive(FArchive& Archive, const TArray<uint8>
 		return false;
 	}
 
-	int32 SavedUE4Version;
-	Archive << SavedUE4Version;
+	// Unreal 5 has changed the archive version to be a struct. For previous saves, we
+	// convert the old integer to this new struct.
+	FPackageFileVersion SavedUEVersion;
+	if (SavegameFileVersion < 6)
+	{
+		int32 SavedUE4Version;
+		Archive << SavedUE4Version;
+		SavedUEVersion = FPackageFileVersion::CreateUE4Version((EUnrealEngineObjectUE4Version)SavedUE4Version);
+	}
+	else
+	{
+		Archive << SavedUEVersion;
+	}
 
-	Archive.SetUE4Ver(SavedUE4Version);
+	Archive.SetUEVer(SavedUEVersion);
 
 	return true;
 }
@@ -1173,7 +1223,7 @@ bool UPersistenceManager::DeleteContainer(const FName& ContainerName, bool Block
 
 				CurrentData->Containers.RemoveAt(i);
 
-				Container->MarkPendingKill();
+				Container->MarkAsGarbage();
 
 				// If we have a level loaded for this container, remove it from our list.
 				// That way we won't recreate the container we just deleted if a save is
@@ -1290,7 +1340,7 @@ void UPersistenceManager::OnCanLevelActorsInitialize(ULevel* Level, UWorld* Worl
 {
 	// The engine is ready to finish loading this level.  If we aren't done loading
 	// dynamic actors for the level, ask it to wait.
-	if (GetInstance(World) == this && World->IsServer())
+	if (GetInstance(World) == this && !World->IsNetMode(NM_Client))
 	{
 		if (const FName* LevelKey = LoadedLevels.Find(Level))
 		{
@@ -1311,7 +1361,7 @@ void UPersistenceManager::OnLevelActorsInitialized(ULevel* Level, UWorld* World)
 
 	SCOPE_CYCLE_COUNTER(STAT_PersistenceGunfire_SpawnDynamicActors);
 
-	if (GetInstance(World) == this && World->IsServer())
+	if (GetInstance(World) == this && !World->IsNetMode(NM_Client))
 	{
 		bool SpawnedActors = true;
 
@@ -1338,7 +1388,7 @@ void UPersistenceManager::OnLevelPreRemoveFromWorld(ULevel* Level, UWorld* World
 
 	ProcessCachedLoads();
 
-	if (GetInstance(World) == this && World->IsServer())
+	if (GetInstance(World) == this && !World->IsNetMode(NM_Client))
 	{
 		// It's possible to not have a save in the editor so account for that here.
 		if (CurrentData != nullptr)
@@ -1350,9 +1400,32 @@ void UPersistenceManager::OnLevelPreRemoveFromWorld(ULevel* Level, UWorld* World
 			{
 				if (auto Components = RegisteredActors.Find(*LevelKey))
 				{
-					UPersistenceContainer* Container = GetContainer(*LevelKey, true);
-					Container->WriteData(*Components, *this);
-					Container->Pack();
+					bool WriteContainer = true;
+
+					// If we don't have any actors registered anymore and we don't have any
+					// destroyed actors to persist we don't need this container anymore
+					// and can remove it.
+					if (Components->Num() == 0)
+					{
+						UPersistenceContainer* Container = GetContainer(*LevelKey, false);
+
+						if (!Container || !Container->HasDestroyed())
+						{
+							WriteContainer = false;
+
+							if (DeleteContainer(*LevelKey, true))
+							{
+								UE_LOG(LogGunfireSaveSystem, Log, TEXT("Deleting container '%s' on level unload because it's unused"), *LevelKey->ToString());
+							}
+						}
+					}
+
+					if (WriteContainer)
+					{
+						UPersistenceContainer* Container = GetContainer(*LevelKey, true);
+						Container->WriteData(*Components, *this);
+						Container->Pack();
+					}
 				}
 			}
 		}

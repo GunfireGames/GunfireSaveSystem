@@ -23,9 +23,9 @@ inline bool UPersistenceComponent::IsPersistableObject(AActor* pObject) const
 
 #if WITH_EDITOR
 
-void UPersistenceComponent::PreSave(const class ITargetPlatform* TargetPlatform)
+void UPersistenceComponent::PreSave(FObjectPreSaveContext SaveContext)
 {
-	Super::PreSave(TargetPlatform);
+	Super::PreSave(SaveContext);
 
 	HasModifiedSaveValues = UPersistenceUtils::HasModifiedSaveProperties(GetOwner());
 

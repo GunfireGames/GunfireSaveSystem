@@ -22,7 +22,7 @@ protected:
 	void CachePersistenceManager(UObject* WorldContextObject);
 
 	UPROPERTY(Transient)
-	UPersistenceManager* PersistenceManager = nullptr;
+	TObjectPtr<UPersistenceManager> PersistenceManager = nullptr;
 };
 
 UCLASS()

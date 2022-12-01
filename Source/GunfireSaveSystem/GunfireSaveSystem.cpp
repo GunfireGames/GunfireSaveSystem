@@ -20,17 +20,17 @@ void FGunfireSaveSystemModule::StartupModule()
 {
 #if WITH_EDITOR
 	// Listen for world creation, so we can do some deferred initialization
-	FWorldDelegates::OnPreWorldInitialization.AddRaw(this, &FGunfireSaveSystemModule::OnWorldCreated);
+	FWorldDelegates::OnPreWorldInitialization.AddRaw(this, &ThisClass::OnWorldCreated);
 
 	// Listen for a map opening as marking existing layers dirty can only be done once
 	// loading has completed. This is also the point at which persistent ids are generated
 	// for objects that had a PersistenceComponent to their blueprint but the map has not
 	// yet been saved.  This ensures the appropriate layers get dirtied so they can be
 	// saved without the user having to actively modify them.
-	FEditorDelegates::OnMapOpened.AddRaw(this, &FGunfireSaveSystemModule::OnMapOpened);
+	FEditorDelegates::OnMapOpened.AddRaw(this, &ThisClass::OnMapOpened);
 
 	// Listen for any level changes so we can re-parent them to our custom type
-	FWorldDelegates::LevelAddedToWorld.AddRaw(this, &FGunfireSaveSystemModule::OnLevelAddedToWorld);
+	FWorldDelegates::LevelAddedToWorld.AddRaw(this, &ThisClass::OnLevelAddedToWorld);
 #endif
 }
 
@@ -156,7 +156,7 @@ void FGunfireSaveSystemModule::OnWorldCreated(UWorld* World, const UWorld::Initi
 	if (!bInitialized && GUnrealEd)
 	{
 		bInitialized = true;
-		GEditor->OnBlueprintPreCompile().AddRaw(this, &FGunfireSaveSystemModule::OnBlueprintPreCompile);
+		GEditor->OnBlueprintPreCompile().AddRaw(this, &ThisClass::OnBlueprintPreCompile);
 	}
 }
 
@@ -166,7 +166,7 @@ void FGunfireSaveSystemModule::OnBlueprintPreCompile(UBlueprint* Blueprint)
 	// Cache them off and restore after the compile is done.
 	if (ALevelScriptActorGunfire* ScriptActor = GetBlueprintLevelScriptActor(Blueprint))
 	{
-		Blueprint->OnCompiled().AddRaw(this, &FGunfireSaveSystemModule::OnBlueprintCompiled);
+		Blueprint->OnCompiled().AddRaw(this, &ThisClass::OnBlueprintCompiled);
 		CurrentLevelActorUniqueID = ScriptActor->UniqueIDGenerator;
 	}
 }

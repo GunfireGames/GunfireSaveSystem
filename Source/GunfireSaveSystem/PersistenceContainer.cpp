@@ -246,9 +246,12 @@ bool UPersistenceContainer::SpawnDynamicActors(ULevel* Level, UPersistenceManage
 {
 	// If we already finished the load (or everything was already loaded), spawn the
 	// dynamic actors now.
-	if (LoadState == EClassLoadState::Complete)
+	if (LoadState == EClassLoadState::SpawningDynamicActors)
 	{
 		SpawnDynamicActorsInternal(Level, Manager, true);
+
+		LoadState = EClassLoadState::Complete;
+
 		return true;
 	}
 	// If we're still preloading, switch to a state where the dynamic actors will be
@@ -361,14 +364,14 @@ void UPersistenceContainer::OnDynamicActorsLoaded(ULevel* Level)
 	// Still haven't tried to spawn the actors, just flag them as ready
 	if (LoadState == EClassLoadState::Preloading)
 	{
-		LoadState = EClassLoadState::Complete;
+		LoadState = EClassLoadState::SpawningDynamicActors;
 
 		UE_LOG(LogGunfireSaveSystem, Log, TEXT("Dynamic actors for container '%s' finished loading"), *Key.ToString());
 	}
 	// Already tried to spawn the actors earlier, so do it now
 	else if (LoadState == EClassLoadState::WaitingForPreload)
 	{
-		LoadState = EClassLoadState::Complete;
+		LoadState = EClassLoadState::SpawningDynamicActors;
 
 		UE_LOG(LogGunfireSaveSystem, Log, TEXT("Dynamic actors for container '%s' finished loading, spawning actors"), *Key.ToString());
 

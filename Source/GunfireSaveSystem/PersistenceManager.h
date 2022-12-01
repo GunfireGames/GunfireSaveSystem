@@ -38,7 +38,7 @@ protected:
 	FPersistenceKey Key;
 
 	UPROPERTY(Transient)
-	AActor* CachedActor = nullptr;
+	TObjectPtr<AActor> CachedActor = nullptr;
 };
 
 UCLASS(config = EditorPerProjectUserSettings)
@@ -373,14 +373,14 @@ protected:
 
 	// The current save data.  This may include uncommitted changes.
 	UPROPERTY(Transient)
-	USaveGameWorld* CurrentData = nullptr;
+	TObjectPtr<USaveGameWorld> CurrentData = nullptr;
 
 	UPROPERTY(Transient)
-	USaveGameProfile* UserProfile = nullptr;
+	TObjectPtr<USaveGameProfile> UserProfile = nullptr;
 
 	// Quick lookup to get the container name from a loaded level
 	UPROPERTY(Transient)
-	TMap<ULevel*, FName> LoadedLevels;
+	TMap<TObjectPtr<ULevel>, FName> LoadedLevels;
 
 	// All the currently active persistent objects, organized by container. Persistence
 	// components should always unregister themselves before destructing, so we should
@@ -390,10 +390,10 @@ protected:
 	bool IsCachingUnloads = false;
 
 	UPROPERTY(Transient)
-	TArray<ULevel*> CachedUnloads;
+	TArray<TObjectPtr<ULevel>> CachedUnloads;
 
 	UPROPERTY(Transient)
-	TArray<ULevel*> CachedLoads;
+	TArray<TObjectPtr<ULevel>> CachedLoads;
 
 	bool bDisableCommit = false;
 

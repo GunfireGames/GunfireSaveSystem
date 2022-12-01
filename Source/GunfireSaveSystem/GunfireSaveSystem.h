@@ -4,12 +4,19 @@
 
 #include "CoreMinimal.h"
 #include "Modules/ModuleManager.h"
+#include "WindowsSaveGameSystem.h"
 
 class FGunfireSaveSystemModule : public IModuleInterface
 {
+	typedef FGunfireSaveSystemModule ThisClass;
+
 public:
 	virtual void StartupModule() override;
 	virtual void ShutdownModule() override;
+
+#if USE_WINDOWS_SAVEGAMESYSTEM
+	FWindowsSaveGameSystem WindowsSaveGameSystem;
+#endif
 
 #if WITH_EDITOR
 protected:

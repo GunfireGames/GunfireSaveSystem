@@ -35,11 +35,6 @@ In the callbacks section of World.h the following new callbacks should be added:
 
 	// ~@Gunfire Begin ///////////////////////////////////////////////////////////////////
 
-	// Sent before a ULevel is removed from the world via UWorld::RemoveFromWorld or 
-	// LoadMap (a NULL object means the LoadMap case, because all levels will be 
-	// removed from the world without a RemoveFromWorld call for each)
-	static FOnLevelChanged			LevelPreRemoveFromWorld;
-
 	// Called during PostLoad on a level.  Note: may be asynchronous.
 	static FOnLevelChanged			LevelPostLoad;
 
@@ -58,14 +53,10 @@ In ULevel::PostLoad, after "UWorldComposition::OnLevelPostLoad(this);" add:
 
 	FWorldDelegates::LevelPostLoad.Broadcast(this, OwningWorld);
 
-In UWorld::RemoveFromWorld, at the beginning of the block "if ( bFinishRemovingLevel )" add:
-
-	FWorldDelegates::LevelPreRemoveFromWorld.Broadcast(Level, this);
-
-In UWorld::AddToWorld, modify the block "if( bExecuteNextStep && !Level->bAlreadyRoutedActorInitialize )" to the following:
+In UWorld::AddToWorld, modify the block "if (bExecuteNextStep && !Level->IsFinishedRouteActorInitialization())" to the following:
 
 	// Route various initialization functions and set volumes.
-	if( bExecuteNextStep && !Level->bAlreadyRoutedActorInitialize )
+	if (bExecuteNextStep && !Level->IsFinishedRouteActorInitialization())
 	{
 		// @Gunfire Begin
 		bool CanInitialize = true;
@@ -80,17 +71,64 @@ In UWorld::AddToWorld, modify the block "if( bExecuteNextStep && !Level->bAlread
 
 		QUICK_SCOPE_CYCLE_COUNTER(STAT_AddToWorldTime_RouteActorInitialize);
 		SCOPE_TIME_TO_VAR(&RouteActorInitializeTime);
+		const int32 NumActorsToProcess = (!bConsiderTimeLimit || !IsGameWorld() || IsRunningCommandlet()) ? 0 : GLevelStreamingRouteActorInitializationGranularity;
 		bStartup = 1;
-		Level->RouteActorInitialize();
-		Level->bAlreadyRoutedActorInitialize = true;
+		do 
+		{
+			Level->RouteActorInitialize(NumActorsToProcess);
+		} while (!Level->IsFinishedRouteActorInitialization() && !IsTimeLimitExceeded(TEXT("routing Initialize on actors"), StartTime, Level, TimeLimit));
 		bStartup = 0;
 
-		bExecuteNextStep = (!bConsiderTimeLimit || !IsTimeLimitExceeded( TEXT("routing Initialize on actors"), StartTime, Level, TimeLimit ));
+		bExecuteNextStep = Level->IsFinishedRouteActorInitialization() && (!bConsiderTimeLimit || !IsTimeLimitExceeded( TEXT("routing Initialize on actors"), StartTime, Level, TimeLimit ));
 
 		// @Gunfire Begin
-		FWorldDelegates::LevelActorsInitialized.Broadcast(Level, this);
+		if (bExecuteNextStep)
+		{
+			FWorldDelegates::LevelActorsInitialized.Broadcast(Level, this);
+		}
 		}
 		// @Gunfire End
 	}
 
+Optionally, you can define a CreateDefaultSaveGameSystem callback, so you can better control where savegames go on Windows.
 
+In SaveGameSystem.h, add the following to ISaveGameSystem:
+
+	// @Gunfire Begin
+	// Adding a way to override the default save game system for platforms that fall back
+	// to the generic one. This needs to be hooked before the first call to
+	// IPlatformFeaturesModule::GetSaveGameSystem. The pointer will never be deleted, so
+	// you're expected to return a static instance, or expect that it'll leak on shutdown.
+	DECLARE_DELEGATE_RetVal(ISaveGameSystem*, FCreateDefaultSaveGameSystem);
+	static FCreateDefaultSaveGameSystem CreateDefaultSaveGameSystem;
+	// @Gunfire End
+
+Then in PlatformFeatures.cpp modify GetSaveGameSystem to this:
+
+	// @Gunfire - It's kind of crappy to put this here, but SaveGameSystem doesn't have a cpp
+	ISaveGameSystem::FCreateDefaultSaveGameSystem ISaveGameSystem::CreateDefaultSaveGameSystem;
+
+	ISaveGameSystem* IPlatformFeaturesModule::GetSaveGameSystem()
+	{
+		// @Gunfire Begin
+		static ISaveGameSystem* DefaultSaveGame = nullptr;
+
+		if (DefaultSaveGame == nullptr)
+		{
+			if (ISaveGameSystem::CreateDefaultSaveGameSystem.IsBound())
+			{
+				DefaultSaveGame = ISaveGameSystem::CreateDefaultSaveGameSystem.Execute();
+			}
+
+			if (DefaultSaveGame == nullptr)
+			{
+				static FGenericSaveGameSystem GenericSaveGame;
+				DefaultSaveGame = &GenericSaveGame;
+			}
+		}
+
+		return DefaultSaveGame;
+		// @Gunfire End
+	}
+
+Once you've done that you can go into WindowsSaveGameSystem.h and set USE_WINDOWS_SAVEGAMESYSTEM to 1 when PLATFORM_WINDOWS is defined. This will redirect Steam and EOS savegames to be in the Windows "Saved Games", and give you a hook where you can do things like put games in a subfolder based on the Steam user profile id.
