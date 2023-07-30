@@ -25,7 +25,6 @@ protected:
 	struct FHeader
 	{
 		uint32 Version = 0;
-		int32  UE4Version = GPackageFileUE4Version;
 		uint32 IndexOffset = 0;
 		uint32 DynamicOffset = 0;
 	};
@@ -35,13 +34,6 @@ protected:
 		uint64 UniqueID = 0;
 		uint32 Offset = 0;
 		uint32 Length = 0;
-	};
-
-	struct FDestroyed
-	{
-		uint64 UniqueID = 0;
-
-		bool operator==(const FDestroyed& Other) const { return UniqueID == Other.UniqueID; }
 	};
 
 public:
@@ -68,7 +60,7 @@ public:
 	// SpawnDynamicActors.
 	void PreloadDynamicActors(ULevel* Level, UPersistenceManager& Manager);
 
-	bool IsPreloadingDynamicActors() const;
+	bool IsPreloadingDynamicActors(bool bCheckDelegates = false) const;
 	bool HasSpawnedDynamicActors() const;
 
 	// Called after a level is done loading, to spawn any persistent dynamic actors
@@ -110,7 +102,7 @@ protected:
 	uint64 SpawningActorID;
 
 	// Persistent id's of non-dynamic destroyed actors.
-	TArray<FDestroyed> Destroyed;
+	TArray<uint64> Destroyed;
 
 	enum class EClassLoadState
 	{

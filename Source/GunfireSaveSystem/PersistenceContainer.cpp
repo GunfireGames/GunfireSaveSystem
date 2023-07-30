@@ -14,6 +14,8 @@
 #include "Serialization/MemoryWriter.h"
 #include "UObject/Package.h"
 
+#include UE_INLINE_GENERATED_CPP_BY_NAME(PersistenceContainer)
+
 DECLARE_CYCLE_STAT(TEXT("Container WriteData"), STAT_PersistenceGunfire_ContainerWriteData, STATGROUP_Persistence);
 DECLARE_CYCLE_STAT(TEXT("Container Unpack"), STAT_PersistenceGunfire_ContainerUnpack, STATGROUP_Persistence);
 
@@ -23,7 +25,9 @@ DECLARE_CYCLE_STAT(TEXT("Container Unpack"), STAT_PersistenceGunfire_ContainerUn
 // Version History
 // 1: Initial version
 // 2: Removed UniqueName field
-#define CONTAINER_VERSION 2
+// 3: Switched to FTopLevelAssetPath for dynamic actor references
+// 4: Got rid of UE4 version
+#define CONTAINER_VERSION 4
 
 //////////////////////////////////////////////////////////////////////////////////////////
 
@@ -76,7 +80,9 @@ void UPersistenceContainer::Unpack()
 	Destroyed.Reset();
 
 	if (Blob.Data.Num() == 0)
+	{
 		return;
+	}
 
 	FMemoryReader Ar(Blob.Data, true);
 
@@ -104,9 +110,9 @@ void UPersistenceContainer::Unpack()
 	Ar << NumDestroyed;
 	Destroyed.SetNumUninitialized(NumDestroyed);
 
-	for (FDestroyed& DestroyedInfo : Destroyed)
+	for (uint64& DestroyedID : Destroyed)
 	{
-		Ar << DestroyedInfo.UniqueID;
+		Ar << DestroyedID;
 		if (Header.Version < 2)
 		{
 			FName Unused;
@@ -189,7 +195,7 @@ void UPersistenceContainer::WriteData(TArrayView<TWeakObjectPtr<UPersistenceComp
 
 				Ar << Transform;
 
-				FString ClassPath = Actor->GetClass()->GetPathName();
+				FTopLevelAssetPath ClassPath = Actor->GetClass()->GetClassPathName();
 				Ar << ClassPath;
 			}
 		}
@@ -213,9 +219,9 @@ void UPersistenceContainer::WriteData(TArrayView<TWeakObjectPtr<UPersistenceComp
 	uint32 NumDestroyed = Destroyed.Num();
 	Ar << NumDestroyed;
 
-	for (FDestroyed& DestroyedID : Destroyed)
+	for (uint64& DestroyedID : Destroyed)
 	{
-		Ar << DestroyedID.UniqueID;
+		Ar << DestroyedID;
 	}
 
 	//
@@ -232,8 +238,16 @@ void UPersistenceContainer::PreloadDynamicActors(ULevel* Level, UPersistenceMana
 	}
 }
 
-bool UPersistenceContainer::IsPreloadingDynamicActors() const
+bool UPersistenceContainer::IsPreloadingDynamicActors(bool bCheckDelegates) const
 {
+	// If we requested to check delegates, check if the delegate is complete but not triggered yet, and allow the
+	// loading to continue in that case.
+	if (bCheckDelegates && LoadState == EClassLoadState::Preloading &&
+		DynamicActorLoad.IsValid() && DynamicActorLoad->HasLoadCompleted())
+	{
+		return false;
+	}
+
 	return LoadState == EClassLoadState::Preloading;
 }
 
@@ -292,17 +306,27 @@ void UPersistenceContainer::SpawnDynamicActorsInternal(ULevel* Level, UPersisten
 		// Add offset if there is one
 		Manager.AddLevelOffset(Level, Transform);
 
-		FString ClassPath;
-		Ar << ClassPath;
+		FTopLevelAssetPath ClassPath;
+
+		if (Header.Version >= 3)
+		{
+			Ar << ClassPath;
+		}
+		else
+		{
+			FString OldClassPath;
+			Ar << OldClassPath;
+			ClassPath.TrySetPath(OldClassPath);
+		}
 
 		if (!Spawn)
 		{
-			ClassesToLoad.AddUnique(ClassPath);
+			ClassesToLoad.AddUnique(FSoftObjectPath(ClassPath));
 		}
 		else
 		{
 			// Try to find the class
-			UClass* ClassInfo = FindObject<UClass>(ANY_PACKAGE, *ClassPath);
+			UClass* ClassInfo = FindObject<UClass>(ClassPath);
 
 			if (ClassInfo != nullptr)
 			{
@@ -392,12 +416,9 @@ uint64 UPersistenceContainer::GetDynamicActorID()
 
 void UPersistenceContainer::SetDestroyed(UPersistenceComponent* Component)
 {
-	FDestroyed DestroyedID;
-	DestroyedID.UniqueID = Component->UniqueID;
+	ensureMsgf(!Destroyed.Contains(Component->UniqueID), TEXT("Adding destroyed actor twice"));
 
-	ensureMsgf(!Destroyed.Contains(DestroyedID), TEXT("Adding destroyed actor twice"));
-
-	Destroyed.Emplace(DestroyedID);
+	Destroyed.Emplace(Component->UniqueID);
 }
 
 void UPersistenceContainer::LoadData(UPersistenceComponent* Component, UPersistenceManager& Manager) const
@@ -416,7 +437,7 @@ void UPersistenceContainer::LoadData(UPersistenceComponent* Component, UPersiste
 		ReadData(Component, Manager, Ar);
 	}
 	// Otherwise, check if it's been marked as destroyed
-	else if (Destroyed.ContainsByPredicate([=](const FDestroyed& RHS) { return Component->UniqueID == RHS.UniqueID; }))
+	else if (Destroyed.Contains(Component->UniqueID))
 	{
 		Component->DestroyPersistentActor();
 	}
@@ -427,7 +448,6 @@ void UPersistenceContainer::WriteHeader(FArchive& Ar, FHeader Header) const
 	Ar.Seek(0);
 
 	Ar << Header.Version;
-	Ar << Header.UE4Version;
 	Ar << Header.IndexOffset;
 	Ar << Header.DynamicOffset;
 }
@@ -438,7 +458,11 @@ UPersistenceContainer::FHeader UPersistenceContainer::ReadHeader(FArchive& Ar) c
 
 	FHeader Header;
 	Ar << Header.Version;
-	Ar << Header.UE4Version;
+	if (Header.Version < 4)
+	{
+		int32 UE4Version;
+		Ar << UE4Version;
+	}
 	Ar << Header.IndexOffset;
 	Ar << Header.DynamicOffset;
 

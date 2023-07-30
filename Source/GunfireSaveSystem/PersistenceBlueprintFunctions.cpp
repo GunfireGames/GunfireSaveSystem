@@ -4,6 +4,8 @@
 #include "SaveGameWorld.h"
 #include "Engine/Engine.h"
 
+#include UE_INLINE_GENERATED_CPP_BY_NAME(PersistenceBlueprintFunctions)
+
 void UPersistenceCallbackProxy::CachePersistenceManager(UObject* WorldContextObject)
 {
 	PersistenceManager = UPersistenceManager::GetInstance(WorldContextObject);
@@ -372,12 +374,12 @@ void URestoreSlotBackupCallbackProxy::OnCompleteFunc(bool Result)
 
 //////////////////////////////////////////////////////////////////////////////////////////
 
-UPersistenceManager* UPersistenceBlueprintFunctionLibrary::GetPersistenceManager(UObject* WorldContextObject)
+UPersistenceManager* UPersistenceBlueprintFunctionLibrary::GetPersistenceManager(const UObject* WorldContextObject)
 {
 	return UPersistenceManager::GetInstance(WorldContextObject);
 }
 
-void UPersistenceBlueprintFunctionLibrary::CommitSave(UObject* WorldContextObject, FString Reason)
+void UPersistenceBlueprintFunctionLibrary::CommitSave(const UObject* WorldContextObject, const FString Reason)
 {
 	if (UPersistenceManager* PersistenceManager = UPersistenceManager::GetInstance(WorldContextObject))
 	{
@@ -385,9 +387,9 @@ void UPersistenceBlueprintFunctionLibrary::CommitSave(UObject* WorldContextObjec
 	}
 }
 
-USaveGameWorld* UPersistenceBlueprintFunctionLibrary::GetCurrentSave(UObject* WorldContextObject)
+USaveGameWorld* UPersistenceBlueprintFunctionLibrary::GetCurrentSave(const UObject* WorldContextObject)
 {
-	if (UPersistenceManager* PersistenceManager = UPersistenceManager::GetInstance(WorldContextObject))
+	if (const UPersistenceManager* PersistenceManager = UPersistenceManager::GetInstance(WorldContextObject))
 	{
 		return PersistenceManager->GetCurrentSave();
 	}
@@ -395,9 +397,9 @@ USaveGameWorld* UPersistenceBlueprintFunctionLibrary::GetCurrentSave(UObject* Wo
 	return nullptr;
 }
 
-USaveGameProfile* UPersistenceBlueprintFunctionLibrary::GetProfileSave(UObject* WorldContextObject)
+USaveGameProfile* UPersistenceBlueprintFunctionLibrary::GetProfileSave(const UObject* WorldContextObject)
 {
-	if (UPersistenceManager* PersistenceManager = UPersistenceManager::GetInstance(WorldContextObject))
+	if (const UPersistenceManager* PersistenceManager = UPersistenceManager::GetInstance(WorldContextObject))
 	{
 		return PersistenceManager->GetProfileSave();
 	}
@@ -405,7 +407,7 @@ USaveGameProfile* UPersistenceBlueprintFunctionLibrary::GetProfileSave(UObject* 
 	return nullptr;
 }
 
-void UPersistenceBlueprintFunctionLibrary::SetDisableCommit(UObject* WorldContextObject, bool DisableCommit)
+void UPersistenceBlueprintFunctionLibrary::SetDisableCommit(const UObject* WorldContextObject, bool DisableCommit)
 {
 	if (UPersistenceManager* PersistenceManager = UPersistenceManager::GetInstance(WorldContextObject))
 	{
@@ -413,7 +415,7 @@ void UPersistenceBlueprintFunctionLibrary::SetDisableCommit(UObject* WorldContex
 	}
 }
 
-AActor* UPersistenceBlueprintFunctionLibrary::GetReference(UObject* WorldContextObject, FPersistentReference& Reference)
+AActor* UPersistenceBlueprintFunctionLibrary::GetReference(const UObject* WorldContextObject, FPersistentReference& Reference)
 {
 	if (UWorld* World = GEngine->GetWorldFromContextObject(WorldContextObject, EGetWorldErrorMode::ReturnNull))
 	{

@@ -56,7 +56,9 @@ FArchive& FObjectRefAndFNameArchive::operator<<(class FName& N)
 		// Most names don't have a number, so to save some space don't write the number
 		// and just set the high bit on the index instead.
 		if (Number != 0)
+		{
 			Index |= HAS_NUMBER;
+		}
 	}
 
 	*this << Index;
@@ -87,7 +89,7 @@ void FObjectRefAndFNameArchive::WriteTable()
 	*this << NumStrings;
 
 	FString SavedString;
-	for (const auto& NamePair : NameMap)
+	for (const TPair<FName, int32>& NamePair : NameMap)
 	{
 		SavedString = NamePair.Key.ToString();
 		*this << SavedString;
@@ -359,7 +361,7 @@ bool FSaveGameArchive::GetClassesToLoad(TArray<FSoftObjectPath>& ClassesToLoad)
 			*this << OuterID;
 		}
 
-		UObject* Object = FindObject<UObject>(ANY_PACKAGE, *TempString, false);
+		UObject* Object = FindObject<UObject>(nullptr, *TempString, false);
 		if (!Object)
 		{
 			ClassesToLoad.AddUnique(TempString);
@@ -401,7 +403,7 @@ void FSaveGameArchive::ReadBaseObject(UObject* BaseObject)
 		}
 		else
 		{
-			Object = FindObject<UObject>(ANY_PACKAGE, *TempString, false);
+			Object = FindObject<UObject>(nullptr, *TempString, false);
 			if (!Object)
 			{
 				UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Block loading object '%s', this will cause hitches"), *TempString);

@@ -19,14 +19,18 @@
 #include "Kismet/GameplayStatics.h"
 #include "PlatformFeatures.h"
 #include "SaveGameSystem.h"
+#include "Serialization/ArchiveLoadCompressedProxy.h"
+#include "Serialization/ArchiveSaveCompressedProxy.h"
 #include "Serialization/MemoryReader.h"
 #include "Serialization/MemoryWriter.h"
 
-#include "Launch/Resources/Version.h"
+#include UE_INLINE_GENERATED_CPP_BY_NAME(PersistenceManager)
 
 DECLARE_CYCLE_STAT(TEXT("Commit Save"), STAT_PersistenceGunfire_CommitSave, STATGROUP_Persistence);
 DECLARE_CYCLE_STAT(TEXT("Spawn Dynamic Actors"), STAT_PersistenceGunfire_SpawnDynamicActors, STATGROUP_Persistence);
 DECLARE_CYCLE_STAT(TEXT("Process Cached Loads"), STAT_PersistenceGunfire_ProcessCachedLoads, STATGROUP_Persistence);
+DECLARE_CYCLE_STAT(TEXT("Compress Save"), STAT_PersistenceGunfire_CompressSave, STATGROUP_Persistence);
+DECLARE_CYCLE_STAT(TEXT("Decompress Save"), STAT_PersistenceGunfire_DecompressSave, STATGROUP_Persistence);
 
 // Use different save names in PIE vs game, since on PC dev builds they'll output to the same spot
 #if WITH_EDITOR
@@ -54,7 +58,10 @@ TAutoConsoleVariable<int32> CVarPersistenceDebug(TEXT("SaveSystem.Debug"), 0, TE
 // 4: Added checksum (not backwards compatible)
 // 5: Optimized the persistence archive by not always writing the full path to objects
 // 6: Updated saved UE version from an int32 (UE4) to the FPackageFileVersion struct (UE5)
-static const int32 GUNFIRE_PERSISTENCE_VERSION = 6;
+// 7: Switched to FTopLevelAssetPath for save game class reference
+// 8: Stripped UE version from containers
+// 9: Added compression to the final blob
+static const int32 GUNFIRE_PERSISTENCE_VERSION = 9;
 
 //////////////////////////////////////////////////////////////////////////////////////////
 
@@ -130,11 +137,7 @@ UPersistenceManager::UPersistenceManager()
 	{
 		FWorldDelegates::LevelAddedToWorld.AddUObject(this, &ThisClass::OnLevelAddedToWorld);
 		FWorldDelegates::OnPreWorldInitialization.AddUObject(this, &ThisClass::OnPreWorldInitialization);
-#if (ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 1)
 		FWorldDelegates::PreLevelRemovedFromWorld.AddUObject(this, &ThisClass::OnLevelPreRemoveFromWorld);
-#else
-		FWorldDelegates::LevelPreRemoveFromWorld.AddUObject(this, &ThisClass::OnLevelPreRemoveFromWorld);
-#endif
 		FWorldDelegates::LevelRemovedFromWorld.AddUObject(this, &ThisClass::OnLevelRemovedFromWorld);
 		FWorldDelegates::OnWorldCleanup.AddUObject(this, &ThisClass::OnWorldCleanup);
 		FCoreUObjectDelegates::PreLoadMap.AddUObject(this, &ThisClass::OnPreLoadMap);
@@ -660,7 +663,7 @@ FPersistenceKey UPersistenceManager::GetActorKey(AActor* Actor) const
 
 AActor* UPersistenceManager::FindActorByKey(FPersistenceKey Key) const
 {
-	if (auto Components = RegisteredActors.Find(Key.ContainerKey))
+	if (const TArray<TWeakObjectPtr<UPersistenceComponent>>* Components = RegisteredActors.Find(Key.ContainerKey))
 	{
 		for (const TWeakObjectPtr<UPersistenceComponent>& Component : *Components)
 		{
@@ -678,8 +681,7 @@ AActor* UPersistenceManager::FindActorByKey(FPersistenceKey Key) const
 void UPersistenceManager::Register(UPersistenceComponent* pComponent)
 {
 #if !UE_BUILD_SHIPPING
-	TInlineComponentArray<UPersistenceComponent*> PersistenceComponents;
-	pComponent->GetOwner()->GetComponents(PersistenceComponents);
+	TInlineComponentArray<UPersistenceComponent*> PersistenceComponents(pComponent->GetOwner());
 
 	if (PersistenceComponents.Num() > 1)
 	{
@@ -722,7 +724,7 @@ void UPersistenceManager::Unregister(UPersistenceComponent* pComponent, ULevel* 
 		ContainerKey = GetContainerKey(pComponent);
 	}
 
-	if (auto Components = RegisteredActors.Find(ContainerKey))
+	if (TArray<TWeakObjectPtr<UPersistenceComponent>>* Components = RegisteredActors.Find(ContainerKey))
 	{
 		int NumRemoved = Components->Remove(pComponent);
 
@@ -738,16 +740,16 @@ void UPersistenceManager::Unregister(UPersistenceComponent* pComponent, ULevel* 
 		{
 			bool FoundInOtherContainer = false;
 
-			for (auto Iter = RegisteredActors.CreateConstIterator(); Iter; ++Iter)
+			for (TPair<FName, TArray<TWeakObjectPtr<UPersistenceComponent>>>& Iter : RegisteredActors)
 			{
-				if (Iter->Value.Contains(pComponent))
+				if (Iter.Value.Contains(pComponent))
 				{
 					FoundInOtherContainer = true;
 
 					UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Unregistering persistence component on actor %s from container %s when it's actually in %s"),
 						*pComponent->GetOwner()->GetName(),
 						*ContainerKey.ToString(),
-						*Iter->Key.ToString());
+						*Iter.Key.ToString());
 
 					break;
 				}
@@ -936,7 +938,9 @@ void UPersistenceManager::WriteSave(USaveGame* SaveGame, TArray<uint8>& SaveBlob
 	// Write out the build number
 	int32 BuildNumber = 0;
 	if (GetBuildNumber.IsBound())
+	{
 		BuildNumber = GetBuildNumber.Execute();
+	}
 	MemoryWriter << BuildNumber;
 
 	// Write out engine and UE version information
@@ -944,7 +948,7 @@ void UPersistenceManager::WriteSave(USaveGame* SaveGame, TArray<uint8>& SaveBlob
 	MemoryWriter << PackageFileUEVersion;
 
 	// Write the class path so we know what class to load
-	FString SaveGameClassPath = SaveGame->GetClass()->GetPathName();
+	FTopLevelAssetPath SaveGameClassPath = SaveGame->GetClass()->GetClassPathName();
 	MemoryWriter << SaveGameClassPath;
 
 	FSaveGameArchive Ar(MemoryWriter);
@@ -961,7 +965,7 @@ void UPersistenceManager::WriteSave(USaveGame* SaveGame, TArray<uint8>& SaveBlob
 	MemoryWriter << CRC;
 }
 
-bool UPersistenceManager::InitSaveArchive(FArchive& Archive, const TArray<uint8>& SaveBlob, EPersistenceLoadResult* Result)
+bool UPersistenceManager::InitSaveArchive(FArchive& Archive, const TArray<uint8>& SaveBlob, FTopLevelAssetPath& SaveGameClassPath, EPersistenceLoadResult* Result)
 {
 	// Read the CRC from the start of the save
 	uint32 SavedCRC = 0;
@@ -976,7 +980,9 @@ bool UPersistenceManager::InitSaveArchive(FArchive& Archive, const TArray<uint8>
 	if (SavedSize > SaveBlob.Num() || SavedSize <= 8)
 	{
 		if (Result)
+		{
 			*Result = EPersistenceLoadResult::Corrupt;
+		}
 
 		return false;
 	}
@@ -986,8 +992,12 @@ bool UPersistenceManager::InitSaveArchive(FArchive& Archive, const TArray<uint8>
 	if (CalculatedCRC != SavedCRC)
 	{
 		UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Save CRC didn't match (saved: 0x%x, calculated: 0x%x), refusing to load"), SavedCRC, CalculatedCRC);
+
 		if (Result)
+		{
 			*Result = EPersistenceLoadResult::Corrupt;
+		}
+
 		return false;
 	}
 
@@ -997,8 +1007,12 @@ bool UPersistenceManager::InitSaveArchive(FArchive& Archive, const TArray<uint8>
 	if (SavegameFileVersion > GUNFIRE_PERSISTENCE_VERSION)
 	{
 		UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Save version is %d, ours is %d, refusing to load"), SavegameFileVersion, GUNFIRE_PERSISTENCE_VERSION);
+
 		if (Result)
+		{
 			*Result = EPersistenceLoadResult::TooNew;
+		}
+
 		return false;
 	}
 
@@ -1007,15 +1021,21 @@ bool UPersistenceManager::InitSaveArchive(FArchive& Archive, const TArray<uint8>
 
 	int32 CurrentBuildNumber = 0;
 	if (GetBuildNumber.IsBound())
+	{
 		CurrentBuildNumber = GetBuildNumber.Execute();
+	}
 
 	// Just because the build number is newer doesn't mean anything in the save format has
 	// changed, but to be safe we won't load it.
 	if (CurrentBuildNumber != 0 && BuildNumber > CurrentBuildNumber)
 	{
 		UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Save build number is %d, ours is %d, refusing to load"), BuildNumber, CurrentBuildNumber);
+
 		if (Result)
+		{
 			*Result = EPersistenceLoadResult::TooNew;
+		}
+
 		return false;
 	}
 
@@ -1035,32 +1055,44 @@ bool UPersistenceManager::InitSaveArchive(FArchive& Archive, const TArray<uint8>
 
 	Archive.SetUEVer(SavedUEVersion);
 
+	// Get the class path
+	if (SavegameFileVersion >= 7)
+	{
+		Archive << SaveGameClassPath;
+	}
+	else
+	{
+		FString OldClassPath;
+		Archive << OldClassPath;
+		SaveGameClassPath.TrySetPath(OldClassPath);
+	}
+
 	return true;
 }
 
 bool UPersistenceManager::PreloadSave(FThreadJob& Job, const TArray<uint8>& SaveBlob)
 {
 	if (SaveBlob.Num() == 0)
-		return false;
-
-	// Load raw data from memory
-	FMemoryReader MemoryReader(SaveBlob, true);
-
-	if (!InitSaveArchive(MemoryReader, SaveBlob, nullptr))
 	{
 		return false;
 	}
 
-	// Get the class path
-	FString SaveGameClassPath;
-	MemoryReader << SaveGameClassPath;
+	// Load raw data from memory
+	FMemoryReader MemoryReader(SaveBlob, true);
+
+	FTopLevelAssetPath SaveGameClassPath;
+
+	if (!InitSaveArchive(MemoryReader, SaveBlob, SaveGameClassPath, nullptr))
+	{
+		return false;
+	}
 
 	TArray<FSoftObjectPath> ClassesToLoad;
 
-	UClass* SaveGameClass = FindObject<UClass>(ANY_PACKAGE, *SaveGameClassPath);
+	UClass* SaveGameClass = FindObject<UClass>(SaveGameClassPath);
 	if (SaveGameClass == nullptr)
 	{
-		ClassesToLoad.Add(SaveGameClassPath);
+		ClassesToLoad.Add(FSoftObjectPath(SaveGameClassPath));
 	}
 
 	FSaveGameArchive Ar(MemoryReader);
@@ -1087,39 +1119,126 @@ void UPersistenceManager::OnSaveClassesLoaded(FThreadJob* Job)
 		if (UPersistenceManager* ThisPtr = Job->Manager.Get())
 		{
 			if (Job->Type == EJobType::LoadSlot)
+			{
 				ThisPtr->LoadSaveDone(*Job, EPersistenceLoadResult::Success);
+			}
 			else if (Job->Type == EJobType::LoadProfile)
+			{
 				ThisPtr->LoadProfileSaveDone(*Job, EPersistenceLoadResult::Success);
+			}
 			else if (Job->Type == EJobType::ReadSlot)
+			{
 				ThisPtr->ReadSaveDone(*Job, EPersistenceLoadResult::Success);
+			}
 		}
 
 		FreeThreadJob(Job);
 	});
 }
 
+void UPersistenceManager::CompressData(TArray<uint8>& SaveBlob)
+{
+	SCOPE_CYCLE_COUNTER(STAT_PersistenceGunfire_CompressSave);
+
+	// Copy header data (up to savegame version so we can determine if its compressed)
+	TArray<uint8> HeaderBlob;
+	HeaderBlob.Append(SaveBlob.GetData(), 12);
+
+	// Remove the header so that our buffer is 100% compressed
+	TArray<uint8> UncompressedBlob = SaveBlob;
+	UncompressedBlob.RemoveAt(0, 12);
+
+	// Apply Zlib decompression
+	SaveBlob.Reset();
+	FArchiveSaveCompressedProxy Compressor = FArchiveSaveCompressedProxy(SaveBlob, NAME_Zlib);
+
+	int32 UncompressedSize = UncompressedBlob.Num();
+	Compressor.Serialize(&UncompressedSize, 4);
+
+	Compressor.Serialize(UncompressedBlob.GetData(), UncompressedSize);
+	Compressor.Flush();
+
+	// Add the header data back
+	SaveBlob.Insert(HeaderBlob, 0);
+	SaveBlob.Shrink();
+}
+
+bool UPersistenceManager::DecompressData(TArray<uint8>& SaveBlob)
+{
+	if (SaveBlob.Num() < 12)
+	{
+		return false;
+	}
+
+	FMemoryReader MemoryReader(SaveBlob, true);
+	MemoryReader.Seek(8);
+
+	int32 SavegameFileVersion;
+	MemoryReader << SavegameFileVersion;
+
+	// Is this a compressed save?
+	if (SavegameFileVersion <= 8)
+	{
+		return true;
+	}
+
+	SCOPE_CYCLE_COUNTER(STAT_PersistenceGunfire_DecompressSave);
+
+	// Copy header data (up to savegame version so we can determine if its compressed)
+	TArray<uint8> HeaderBlob;
+	HeaderBlob.Append(SaveBlob.GetData(), 12);
+
+	// Remove the header so that our buffer is 100% compressed
+	TArray<uint8> CompressedBlob = SaveBlob;
+	CompressedBlob.RemoveAt(0, 12);
+
+	// Apply Zlib compression
+	SaveBlob.Reset();
+	FArchiveLoadCompressedProxy Decompresser(CompressedBlob, NAME_Zlib);
+
+	if (Decompresser.IsError())
+	{
+		return false;
+	}
+
+	int32 UncompressedSize = 0;
+	Decompresser.Serialize(&UncompressedSize, 4);
+
+	SaveBlob.Reserve(UncompressedSize + HeaderBlob.Num());
+	SaveBlob.SetNum(UncompressedSize);
+
+	Decompresser.Serialize(SaveBlob.GetData(), UncompressedSize);
+	Decompresser.Flush();
+
+	// Add the header data back
+	SaveBlob.Insert(HeaderBlob, 0);
+	SaveBlob.Shrink();
+
+	return true;
+}
+
 USaveGame* UPersistenceManager::ReadSave(const TArray<uint8>& SaveBlob, EPersistenceLoadResult* Result)
 {
 	if (SaveBlob.Num() == 0)
-		return nullptr;
-
-	// Load raw data from memory
-	FMemoryReader MemoryReader(SaveBlob, true);
-
-	if (!InitSaveArchive(MemoryReader, SaveBlob, Result))
 	{
 		return nullptr;
 	}
 
-	// Get the class path
-	FString SaveGameClassPath;
-	MemoryReader << SaveGameClassPath;
+	// Load raw data from memory
+	FMemoryReader MemoryReader(SaveBlob, true);
+
+	FTopLevelAssetPath SaveGameClassPath;
+
+	if (!InitSaveArchive(MemoryReader, SaveBlob, SaveGameClassPath, Result))
+	{
+		return nullptr;
+	}
 
 	// Try to find it, and failing that, load it
-	UClass* SaveGameClass = FindObject<UClass>(ANY_PACKAGE, *SaveGameClassPath);
+	UClass* SaveGameClass = FindObject<UClass>(SaveGameClassPath);
 	if (SaveGameClass == nullptr)
 	{
-		SaveGameClass = LoadObject<UClass>(nullptr, *SaveGameClassPath);
+		SaveGameClass = LoadObject<UClass>(nullptr, *SaveGameClassPath.ToString());
 	}
 
 	// If we have a class, try to load it.
@@ -1131,16 +1250,20 @@ USaveGame* UPersistenceManager::ReadSave(const TArray<uint8>& SaveBlob, EPersist
 		Ar.ReadBaseObject(SaveGame);
 
 		if (Result)
+		{
 			*Result = EPersistenceLoadResult::Success;
+		}
 
 		return SaveGame;
 	}
 	else
 	{
-		UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Save game class couldn't be found: %s"), *SaveGameClassPath);
+		UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Save game class couldn't be found: %s"), *SaveGameClassPath.ToString());
 
 		if (Result)
+		{
 			*Result = EPersistenceLoadResult::Corrupt;
+		}
 
 		return nullptr;
 	}
@@ -1259,7 +1382,7 @@ void UPersistenceManager::PackContainer(const FName& LevelKey)
 	}
 
 #if UE_BUILD_DEBUGGAME
-	auto Actors = RegisteredActors.Find(LevelKey);
+	const TArray<TWeakObjectPtr<UPersistenceComponent>>* Actors = RegisteredActors.Find(LevelKey);
 	if (Actors && Actors->Num() > 0)
 	{
 		ensureMsgf(0, TEXT("Actors weren't unregistered"));
@@ -1342,11 +1465,23 @@ void UPersistenceManager::OnCanLevelActorsInitialize(ULevel* Level, UWorld* Worl
 	// dynamic actors for the level, ask it to wait.
 	if (GetInstance(World) == this && !World->IsNetMode(NM_Client))
 	{
+		// We can get into this case if the world is torn down before it finishes loading up (network error or
+		// something). In that case just let it go.
+		if (World->bIsTearingDown)
+		{
+			return;
+		}
+
+		// If something has triggered a block load no delegates will be triggered until after it's done. So to avoid an
+		// infinite load, tell the container to check if their delegate is done but just not called yet, and continue in
+		// that case.
+		const bool bCheckDelegates = World->GetIsInBlockTillLevelStreamingCompleted();
+
 		if (const FName* LevelKey = LoadedLevels.Find(Level))
 		{
 			if (UPersistenceContainer* Container = GetContainer(*LevelKey, false))
 			{
-				if (Container->IsPreloadingDynamicActors())
+				if (Container->IsPreloadingDynamicActors(bCheckDelegates))
 				{
 					CanInitialize = false;
 				}
@@ -1525,7 +1660,9 @@ void UPersistenceManager::OnWorldCleanup(UWorld* World, bool bSessionEnded, bool
 		if (GetInstance(World) == this)
 		{
 			for (ULevel* Level : CachedUnloads)
+			{
 				OnLevelRemovedFromWorld(Level, World);
+			}
 		}
 		else
 		{
@@ -1766,12 +1903,15 @@ uint32 UPersistenceManager::Run()
 
 				if (Job->WorldData.Num() > 0)
 				{
+					CompressData(Job->WorldData);
+
 					const FString SlotName = GetSlotName(Job->Slot);
 					Ret = SaveSystem->SaveGame(false, *SlotName, UserIndex, Job->WorldData);
 				}
 
 				if (Ret && Job->ProfileData.Num() > 0)
 				{
+					CompressData(Job->ProfileData);
 					Ret = SaveSystem->SaveGame(false, SAVE_PROFILE_NAME, UserIndex, Job->ProfileData);
 				}
 
@@ -1849,7 +1989,14 @@ uint32 UPersistenceManager::Run()
 						TArray<uint8>& Data = IsProfile ? Job->ProfileData : Job->WorldData;
 						if (SaveSystem->LoadGame(false, *SlotName, UserIndex, Data))
 						{
-							Result = EPersistenceLoadResult::Success;
+							if (DecompressData(Data))
+							{
+								Result = EPersistenceLoadResult::Success;
+							}
+							else
+							{
+								Result = EPersistenceLoadResult::Corrupt;
+							}
 						}
 						else
 						{
@@ -1879,11 +2026,17 @@ uint32 UPersistenceManager::Run()
 							if (JobDone)
 							{
 								if (Job->Type == EJobType::LoadSlot)
+								{
 									ThisPtr->LoadSaveDone(*Job, Result);
+								}
 								else if (Job->Type == EJobType::LoadProfile)
+								{
 									ThisPtr->LoadProfileSaveDone(*Job, Result);
+								}
 								else if (Job->Type == EJobType::ReadSlot)
+								{
 									ThisPtr->ReadSaveDone(*Job, Result);
+								}
 							}
 						}
 
@@ -1954,7 +2107,9 @@ void UPersistenceManager::EditorInit()
 	ISaveGameSystem* SaveSystem = IPlatformFeaturesModule::Get().GetSaveGameSystem();
 
 	if (!SaveSystem)
+	{
 		return;
+	}
 
 	const UPersistenceSettings* Settings = GetDefault<UPersistenceSettings>();
 
@@ -1964,8 +2119,10 @@ void UPersistenceManager::EditorInit()
 		// to avoid old garbage messing things up.
 		SaveSystem->DeleteGame(false, SAVE_PROFILE_NAME, 0);
 
-		for (int32 i = 0; i < 8; i++)
+		for (int32 i = 0; i < 8; ++i)
+		{
 			SaveSystem->DeleteGame(false, *GetSlotName(i), 0);
+		}
 	}
 
 	if (Settings->AutomaticallyCreateSave)
@@ -1976,7 +2133,10 @@ void UPersistenceManager::EditorInit()
 
 		if (Settings->AllowEditorSaving && SaveSystem->LoadGame(false, *GetSlotName(0), 0, ObjectBytes))
 		{
-			CurrentData = Cast<USaveGameWorld>(ReadSave(ObjectBytes));
+			if (DecompressData(ObjectBytes))
+			{
+				CurrentData = Cast<USaveGameWorld>(ReadSave(ObjectBytes));
+			}
 		}
 
 		if (CurrentData == nullptr)
@@ -1991,7 +2151,10 @@ void UPersistenceManager::EditorInit()
 		{
 			if (Settings->AllowEditorSaving && SaveSystem->LoadGame(false, SAVE_PROFILE_NAME, 0, ObjectBytes))
 			{
-				UserProfile = Cast<USaveGameProfile>(ReadSave(ObjectBytes));
+				if (DecompressData(ObjectBytes))
+				{
+					UserProfile = Cast<USaveGameProfile>(ReadSave(ObjectBytes));
+				}
 			}
 
 			if (UserProfile == nullptr)

@@ -284,32 +284,32 @@ class GUNFIRESAVESYSTEM_API UPersistenceBlueprintFunctionLibrary : public UBluep
 
 public:
 	UFUNCTION(BlueprintCallable, Category = "Persistence", meta = (WorldContext = "WorldContextObject"))
-	static UPersistenceManager* GetPersistenceManager(UObject* WorldContextObject);
+	static UPersistenceManager* GetPersistenceManager(const UObject* WorldContextObject);
 
 	// Commit the current save to storage and return immediately.  If you need the result
 	// call Commit Save With Result instead.
 	UFUNCTION(BlueprintCallable, Category = "Persistence", meta = (WorldContext = "WorldContextObject"))
-	static void CommitSave(UObject* WorldContextObject, FString Reason);
+	static void CommitSave(const UObject* WorldContextObject, const FString Reason);
 
 	// Gets the current save.  This will return null if a save hasn't been loaded or
 	// created by Load Save.
 	UFUNCTION(BlueprintCallable, Category = "Persistence", meta = (WorldContext = "WorldContextObject"))
-	static USaveGameWorld* GetCurrentSave(UObject* WorldContextObject);
+	static USaveGameWorld* GetCurrentSave(const UObject* WorldContextObject);
 
 	// Gets the profile save.  This will return null if a profile save hasn't been loaded
 	// or created by Load Profile Save.
 	UFUNCTION(BlueprintCallable, Category = "Persistence", meta = (WorldContext = "WorldContextObject"))
-	static USaveGameProfile* GetProfileSave(UObject* WorldContextObject);
+	static USaveGameProfile* GetProfileSave(const UObject* WorldContextObject);
 
 	// If Disable Commit is true, any commit calls will be ignored.  This is a special
 	// case for situations where saving would break things on load, and it is expected
 	// this will be messaged to the user by disabling any save option in the menu.
 	UFUNCTION(BlueprintCallable, Category = "Persistence", meta = (WorldContext = "WorldContextObject"))
-	static void SetDisableCommit(UObject* WorldContextObject, bool DisableCommit);
+	static void SetDisableCommit(const UObject* WorldContextObject, bool DisableCommit);
 
 	// Resolve an actor reference from a persistent reference
 	UFUNCTION(BlueprintPure, Category = "Persistence|Reference", meta = (WorldContext = "WorldContextObject"))
-	static AActor* GetReference(UObject* WorldContextObject, UPARAM(ref) FPersistentReference& Reference);
+	static AActor* GetReference(const UObject* WorldContextObject, UPARAM(ref) FPersistentReference& Reference);
 
 	// Sets a persistent reference via the actor reference provided. This will only
 	// persist if this actor has a persistence component!

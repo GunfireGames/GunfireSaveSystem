@@ -317,10 +317,13 @@ protected:
 	};
 
 	void WriteSave(USaveGame* SaveGame, TArray<uint8>& SaveBlob);
-	bool InitSaveArchive(FArchive& Archive, const TArray<uint8>& SaveBlob, EPersistenceLoadResult* Result);
+	bool InitSaveArchive(FArchive& Archive, const TArray<uint8>& SaveBlob, FTopLevelAssetPath& SaveGameClassPath, EPersistenceLoadResult* Result);
 	bool PreloadSave(FThreadJob& Job, const TArray<uint8>& SaveBlob);
 	USaveGame* ReadSave(const TArray<uint8>& SaveBlob, EPersistenceLoadResult* Result = nullptr);
 	void OnSaveClassesLoaded(FThreadJob* Job);
+
+	void CompressData(TArray<uint8>& SaveBlob);
+	bool DecompressData(TArray<uint8>& SaveBlob);
 
 #if WITH_EDITOR
 	void EditorInit();
@@ -346,7 +349,6 @@ protected:
 
 	USaveGameWorld* CreateSaveGame();
 	USaveGameProfile* CreateSaveProfile();
-	void OnTaskComplete(const struct FPersistenceTaskResults* Results);
 
 	void OnLevelAddedToWorld(ULevel* Level, UWorld* World);
 	void OnLevelPostLoad(ULevel* Level, UWorld* World);

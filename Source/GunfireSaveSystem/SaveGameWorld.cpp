@@ -3,6 +3,8 @@
 #include "SaveGameWorld.h"
 #include "PersistenceComponent.h"
 
+#include UE_INLINE_GENERATED_CPP_BY_NAME(SaveGameWorld)
+
 USaveGameWorld::USaveGameWorld()
 	: UniqueIDGenerator(UPersistenceComponent::RUNTIME_BASE_UID)
 {
