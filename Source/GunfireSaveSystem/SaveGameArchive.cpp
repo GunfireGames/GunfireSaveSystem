@@ -6,165 +6,127 @@
 #include "GameFramework/Actor.h"
 #include "UObject/Package.h"
 
-FObjectRefAndFNameArchive::FObjectRefAndFNameArchive(FArchive& InInnerArchive, bool bInLoadIfFindFails)
-	: FObjectAndNameAsStringProxyArchive(InInnerArchive, bInLoadIfFindFails)
-	, InitialOffset(0)
-	, StringTableOffset(0)
+static const int32 GUNFIRE_SAVEGAME_ARCHIVE_VERSION = 1;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+int32 FNameCache::AddName(const FName& Name)
 {
-	InitialOffset = Tell();
-
-	*this << StringTableOffset;
-
-	if (IsLoading())
+	if (const int32* Index = NameMap.Find(Name))
 	{
-		ReadTable();
+		return *Index;
 	}
+
+	const int32 Index = Names.Num();
+
+	NameMap.Add(Name, Index);
+	Names.Add(Name);
+
+	return Index;
 }
 
-FObjectRefAndFNameArchive::~FObjectRefAndFNameArchive()
+FName FNameCache::GetName(int32 NameIndex) const
 {
-	// TODO: Check that WriteTable was called
+	if (Names.IsValidIndex(NameIndex))
+	{
+		return Names[NameIndex];
+	}
+
+	return NAME_None;
 }
 
-FArchive& FObjectRefAndFNameArchive::operator<<(class FName& N)
+void FNameCache::Serialize(FArchive& Ar)
 {
-	static const int32 HAS_NUMBER = 1 << 15;
-
-	uint16 Index = 0;
-	int32 Number = 0;
-
-	if (IsSaving())
-	{
-		// Object names are typically just dupes with the number set, so to avoid writing
-		// a bunch of duplicate strings take the number out of the equation.
-		FName NoNumberName = N;
-		Number = NoNumberName.GetNumber();
-		NoNumberName.SetNumber(0);
-
-		if (const int32* ExistingIndex = NameMap.Find(NoNumberName))
-		{
-			Index = *ExistingIndex;
-		}
-		else
-		{
-			Index = NameMap.Num();
-			NameMap.Add(NoNumberName, Index);
-		}
-
-		ensureMsgf((Index & HAS_NUMBER) == 0, TEXT("More than 32K unique names?"));
-
-		// Most names don't have a number, so to save some space don't write the number
-		// and just set the high bit on the index instead.
-		if (Number != 0)
-		{
-			Index |= HAS_NUMBER;
-		}
-	}
-
-	*this << Index;
-
-	if ((Index & HAS_NUMBER) != 0)
-	{
-		Index &= ~HAS_NUMBER;
-
-		*this << Number;
-	}
-
-	if (IsLoading())
-	{
-		N = Names[Index];
-		N.SetNumber(Number);
-	}
-
-	return *this;
-}
-
-void FObjectRefAndFNameArchive::WriteTable()
-{
-	StringTableOffset = Tell();
-
-	NameMap.ValueSort(TLess<int32>());
-
-	int32 NumStrings = NameMap.Num();
-	*this << NumStrings;
-
-	FString SavedString;
-	for (const TPair<FName, int32>& NamePair : NameMap)
-	{
-		SavedString = NamePair.Key.ToString();
-		*this << SavedString;
-	}
-
-	NameMap.Empty();
-
-	int64 EndOffset = Tell();
-
-	Seek(InitialOffset);
-	*this << StringTableOffset;
-
-	Seek(EndOffset);
-}
-
-void FObjectRefAndFNameArchive::ReadTable()
-{
-	int64 CurrentPos = Tell();
-	Seek(StringTableOffset);
-
-	int32 NumStrings = 0;
-	*this << NumStrings;
+	int32 NumStrings = Names.Num();
+	Ar << NumStrings;
 	Names.SetNum(NumStrings);
 
 	FString SavedString;
-	for (int32 i = 0; i < NumStrings; i++)
-	{
-		*this << SavedString;
-		Names[i] = FName(*SavedString);
-	}
 
-	Seek(CurrentPos);
+	for (FName& CurName : Names)
+	{
+		if (Ar.IsSaving())
+		{
+			CurName.ToString(SavedString);
+		}
+
+		Ar << SavedString;
+
+		if (Ar.IsLoading())
+		{
+			CurName = FName(*SavedString);
+		}
+	}
 }
 
-//////////////////////////////////////////////////////////////////////////////////////////
+void FNameCache::Reset()
+{
+	NameMap.Reset();
+	Names.Reset();
+}
 
-static const int32 GUNFIRE_SAVEGAME_ARCHIVE_VERSION = 1;
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-FSaveGameArchive::FSaveGameArchive(FArchive& InInnerArchive, bool NoDelta)
-	: FObjectRefAndFNameArchive(InInnerArchive, true)
-	, Version(GUNFIRE_SAVEGAME_ARCHIVE_VERSION)
+FSaveGameArchive::FSaveGameArchive(FArchive& InInnerArchive, FNameCache* SharedNameCache)
+	: FObjectAndNameAsStringProxyArchive(InInnerArchive, true)
+	, NameCache(SharedNameCache ? *SharedNameCache : LocalNameCache)
 {
 	SetIsPersistent(true);
 	ArIsSaveGame = true;
-	ArNoDelta = NoDelta;
+
+	// We're always saving in the current format
+	if (IsSaving())
+	{
+		Version = GUNFIRE_SAVEGAME_ARCHIVE_VERSION;
+	}
 
 	*this << Version;
+
+	InitialOffset = static_cast<int32>(Tell());
+
+	// If we're not using a shared name cache, read in the name cache or reserve the space for it
+	if (!IsSharedNameCache())
+	{
+		int32 NameCacheOffset = 0;
+		*this << NameCacheOffset;
+
+		if (IsLoading())
+		{
+			const int64 CurrentPos = Tell();
+			Seek(NameCacheOffset);
+
+			NameCache.Serialize(*this);
+
+			Seek(CurrentPos);
+		}
+	}
 }
 
-FArchive& FSaveGameArchive::operator<<(class UObject*& Obj)
+FArchive& FSaveGameArchive::operator<<(UObject*& Obj)
 {
-	int32 ObjectID = -1;
+	int32 ObjectIndex = -1;
 
-	// If Obj is null we just skip storing it, and write the ObjectID as -1.
+	// If Obj is null we just skip storing it, and write the ObjectId as -1.
 	if (IsSaving() && Obj)
 	{
 		// Have we written this object yet?
-		ObjectID = Objects.Find(Obj);
+		ObjectIndex = Objects.Find(Obj);
 
-		// If not, generate a unique id for referencing it and add it to our list of
-		// objects to serialize.
-		if (ObjectID == -1)
+		// If not, add it to our list of objects to serialize and use the index as a lookup.
+		if (ObjectIndex == -1)
 		{
-			ObjectID = Objects.Add(Obj);
+			ObjectIndex = Objects.Add(Obj);
 			ObjectsToSerialize.Add(Obj);
 		}
 	}
 
-	*this << ObjectID;
+	*this << ObjectIndex;
 
 	if (IsLoading())
 	{
-		if (Objects.IsValidIndex(ObjectID))
+		if (Objects.IsValidIndex(ObjectIndex))
 		{
-			Obj = Objects[ObjectID];
+			Obj = Objects[ObjectIndex];
 		}
 		else
 		{
@@ -175,38 +137,17 @@ FArchive& FSaveGameArchive::operator<<(class UObject*& Obj)
 	return *this;
 }
 
-FArchive& FSaveGameArchive::operator<<(struct FSoftObjectPtr& Value)
-{
-	*this << Value.GetUniqueID();
-
-	return *this;
-}
-
-FArchive& FSaveGameArchive::operator<<(struct FSoftObjectPath& Value)
-{
-	FString Path = Value.ToString();
-
-	*this << Path;
-
-	if (IsLoading())
-	{
-		Value.SetPath(MoveTemp(Path));
-	}
-
-	return *this;
-}
 
 uint32 FSaveGameArchive::WriteObjectAndLength(UObject* Object)
 {
-	// Write out a stub for the size of the object data.  We'll rewrite it with
-	// the correct size later.
-	int64 ObjectLengthPos = Tell();
+	// Write out a stub for the size of the object data. We'll rewrite it with the correct size later.
+	const int64 ObjectLengthPos = Tell();
 	uint32 ObjectLength = 0;
 	*this << ObjectLength;
 
 	Object->Serialize(*this);
 
-	int64 ObjectEndPos = Tell();
+	const int64 ObjectEndPos = Tell();
 
 	// Calculate the actual object size and seek back and rewrite it.
 	ObjectLength = ObjectEndPos - ObjectLengthPos - sizeof(uint32);
@@ -220,9 +161,8 @@ uint32 FSaveGameArchive::WriteObjectAndLength(UObject* Object)
 
 void FSaveGameArchive::WriteBaseObject(UObject* BaseObject, TMap<FName, bool>& ClassCache)
 {
-	// Write out a stub for the offset where our index for all the objects that were
-	// written is.
-	int64 StartPos = Tell();
+	// Write out a stub for the offset where our index for all the objects that were written is.
+	const int64 StartPos = Tell();
 	int64 ObjectIndexPos = 0;
 	*this << ObjectIndexPos;
 
@@ -230,31 +170,31 @@ void FSaveGameArchive::WriteBaseObject(UObject* BaseObject, TMap<FName, bool>& C
 	Objects.Add(BaseObject);
 	ObjectsToSerialize.Add(BaseObject);
 
-	// Write out the base object, which will add any object properties it has to the
-	// ObjectsToSerialize list.  Keep writing out objects until our list of objects to
-	// serialize is empty (ie, we've recursed to the deepest objects).
+	// Write out the base object, which will add any object properties it has to the ObjectsToSerialize list. Keep
+	// writing out objects until our list of objects to serialize is empty (ie, we've recursed to the deepest objects).
 	while (ObjectsToSerialize.Num() > 0)
 	{
 		UObject* Object = ObjectsToSerialize[0];
 		ObjectsToSerialize.RemoveAt(0, 1, false);
 
-		int32 ObjectID = Objects.Find(Object);
-		*this << ObjectID;
+		int32 ObjectIndex = Objects.Find(Object);
+		*this << ObjectIndex;
 
-		// UClasses don't respect the ArIsSaveGame flag and will write out a bunch of shit,
-		// so we don't call Serialize on them. The relevant info (path of the class) will
-		// still be written out.
+		// UClasses don't respect the ArIsSaveGame flag and will write out a bunch of shit, so we don't call Serialize
+		// on them. The relevant info (path of the class) will still be written out.
 		if (Object->IsA(UClass::StaticClass()))
 		{
 			uint32 ObjectLength = 0;
 			*this << ObjectLength;
 
-			UE_LOG(LogGunfireSaveSystem, VeryVerbose, TEXT("  Class Ref '%s' [%s]"), *Object->GetName(), *Object->GetClass()->GetName());
+			UE_LOG(LogGunfireSaveSystem, VeryVerbose, TEXT("  Class Ref '%s' [%s]"),
+				*FNameBuilder(Object->GetFName()), *FNameBuilder(Object->GetClass()->GetFName()));
 		}
 		else
 		{
-			uint32 ObjectLength = WriteObjectAndLength(Object);
-			UE_LOG(LogGunfireSaveSystem, VeryVerbose, TEXT("  Object '%s' [%s] - %d bytes"), *Object->GetName(), *Object->GetClass()->GetName(), ObjectLength);
+			const uint32 ObjectLength = WriteObjectAndLength(Object);
+			UE_LOG(LogGunfireSaveSystem, VeryVerbose, TEXT("  Object '%s' [%s] - %d bytes"),
+				*FNameBuilder(Object->GetFName()), *FNameBuilder(Object->GetClass()->GetFName()), ObjectLength);
 		}
 
 		uint8 IsActor = 0;
@@ -293,18 +233,15 @@ void FSaveGameArchive::WriteBaseObject(UObject* BaseObject, TMap<FName, bool>& C
 			uint8 WasLoaded = 1;
 			*this << WasLoaded;
 
-			// If this is the base object we don't need to write out the path, it'll be
-			// passed in on load.
-			if (i == 0)
+			FSoftObjectPath ObjectPath;
+
+			// If this is the base object we don't need to write out the path, it'll be passed in on load.
+			if (i != 0)
 			{
-				TempString.Reset();
-			}
-			else
-			{
-				TempString = Object->GetPathName();
+				ObjectPath = Object;
 			}
 
-			*this << TempString;
+			*this << ObjectPath;
 		}
 		// Otherwise, write out the class and name so we can recreate it
 		else
@@ -312,29 +249,42 @@ void FSaveGameArchive::WriteBaseObject(UObject* BaseObject, TMap<FName, bool>& C
 			uint8 WasLoaded = 0;
 			*this << WasLoaded;
 
-			TempString = Object->GetClass()->GetPathName();
-			*this << TempString;
+			FSoftObjectPath ClassPath(Object->GetClass());
+			*this << ClassPath;
 
+			// Write out the object name too, so when we recreate this object on load we can keep the same name
 			FName ObjectName = Object->GetFName();
 			*this << ObjectName;
 
-			// Write out the ID of the outer for this object (or -1 if the outer isn't an
-			// object we're writing).
+			// Write out the index of the outer for this object (or -1 if the outer isn't an object we're writing).
 			// TODO: Should we write the full path if it's not something we're writing?
-			int32 OuterID = Objects.Find(Object->GetOuter());
-			verifyf(OuterID == -1 || OuterID < i, TEXT("Writing inner before outer"));
-			*this << OuterID;
+			int32 OuterIndex = Objects.Find(Object->GetOuter());
+			verifyf(OuterIndex == INDEX_NONE || OuterIndex < i, TEXT("Writing inner before outer"));
+			*this << OuterIndex;
 		}
 	}
 
 	Objects.SetNum(0);
 
-	WriteTable();
+	// If we're not using a shared name cache, write ours out then go back and update the name cache offset
+	if (!IsSharedNameCache())
+	{
+		int32 NameCacheOffset = static_cast<int32>(Tell());
+
+		NameCache.Serialize(*this);
+
+		const int64 EndOffset = Tell();
+
+		Seek(InitialOffset);
+		*this << NameCacheOffset;
+
+		Seek(EndOffset);
+	}
 }
 
 bool FSaveGameArchive::GetClassesToLoad(TArray<FSoftObjectPath>& ClassesToLoad)
 {
-	int64 StartPos = Tell();
+	const int64 StartPos = Tell();
 
 	int64 ObjectIndexPos;
 	*this << ObjectIndexPos;
@@ -350,21 +300,22 @@ bool FSaveGameArchive::GetClassesToLoad(TArray<FSoftObjectPath>& ClassesToLoad)
 		*this << WasLoaded;
 
 		// Read in the path to the object or class
-		*this << TempString;
+		FSoftObjectPath ObjectPath;
+		*this << ObjectPath;
 
+		// At this point we don't need the name or index, so just read them in and throw them away.
 		if (!WasLoaded)
 		{
 			FName ObjectName;
 			*this << ObjectName;
 
-			int32 OuterID;
-			*this << OuterID;
+			int32 OuterIndex;
+			*this << OuterIndex;
 		}
 
-		UObject* Object = FindObject<UObject>(nullptr, *TempString, false);
-		if (!Object)
+		if (ObjectPath.ResolveObject() == nullptr)
 		{
-			ClassesToLoad.AddUnique(TempString);
+			ClassesToLoad.AddUnique(ObjectPath);
 		}
 	}
 
@@ -377,7 +328,7 @@ void FSaveGameArchive::ReadBaseObject(UObject* BaseObject)
 {
 	int64 ObjectIndexPos;
 	*this << ObjectIndexPos;
-	int64 StartPos = Tell();
+	const int64 StartPos = Tell();
 
 	Seek(ObjectIndexPos);
 
@@ -385,15 +336,15 @@ void FSaveGameArchive::ReadBaseObject(UObject* BaseObject)
 	*this << NumUniqueObjects;
 	Objects.SetNum(NumUniqueObjects);
 
-	// Create all the unique objects in advance, so all the pointers are valid before
-	// any objects are read in.
+	// Create all the unique objects in advance, so all the pointers are valid before any objects are read in.
 	for (int32 i = 0; i < Objects.Num(); i++)
 	{
 		uint8 WasLoaded;
 		*this << WasLoaded;
 
 		// Read in the path to the object or class
-		*this << TempString;
+		FSoftObjectPath ObjectPath;
+		*this << ObjectPath;
 
 		UObject* Object = nullptr;
 
@@ -403,11 +354,11 @@ void FSaveGameArchive::ReadBaseObject(UObject* BaseObject)
 		}
 		else
 		{
-			Object = FindObject<UObject>(nullptr, *TempString, false);
+			Object = ObjectPath.ResolveObject();
 			if (!Object)
 			{
-				UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Block loading object '%s', this will cause hitches"), *TempString);
-				Object = LoadObject<UClass>(nullptr, *TempString);
+				UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Block loading object '%s', this will cause hitches"), *ObjectPath.ToString());
+				Object = ObjectPath.TryLoad();
 			}
 		}
 
@@ -420,24 +371,28 @@ void FSaveGameArchive::ReadBaseObject(UObject* BaseObject)
 			FName ObjectName;
 			*this << ObjectName;
 
-			int32 OuterID;
-			*this << OuterID;
+			int32 OuterIndex;
+			*this << OuterIndex;
 
 			// If we found the class, create the object and read it in
 			if (UClass* Class = Cast<UClass>(Object))
 			{
-				// Try to look up the outer for this object.  If it doesn't exist, just use
-				// the transient package.
 				UObject* Outer = nullptr;
-				if (Objects.IsValidIndex(OuterID))
-					Outer = Objects[OuterID];
+
+				// Try to look up the outer for this object. If it doesn't exist, just use the transient package.
+				if (Objects.IsValidIndex(OuterIndex))
+				{
+					Outer = Objects[OuterIndex];
+				}
 				if (Outer == nullptr)
+				{
 					Outer = GetTransientPackage();
+				}
 
 				if (i == 0)
 				{
-					// The first object in the list should always be the base object, so
-					// instead of creating it use the passed in one.
+					// The first object in the list should always be the base object, so instead of creating it use the
+					// passed in one.
 					if (!Class->IsChildOf(BaseObject->GetClass()))
 					{
 						UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Savegame class changed, failing load"));
@@ -454,7 +409,7 @@ void FSaveGameArchive::ReadBaseObject(UObject* BaseObject)
 			}
 			else
 			{
-				UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Couldn't find class '%s' for savegame object"), *TempString);
+				UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Couldn't find class '%s' for savegame object"), *ObjectPath.ToString());
 			}
 		}
 	}
@@ -464,27 +419,30 @@ void FSaveGameArchive::ReadBaseObject(UObject* BaseObject)
 	// Now that all the objects are created, go back and read in their data
 	for (int32 i = 0; i < Objects.Num(); i++)
 	{
-		int32 ObjectID;
-		*this << ObjectID;
+		int32 ObjectIndex;
+		*this << ObjectIndex;
 
 		uint32 ObjectLength;
 		*this << ObjectLength;
 
 		UObject* Object = nullptr;
 
-		if (Objects.IsValidIndex(ObjectID) && Objects[ObjectID] && ObjectLength > 0)
+		if (Objects.IsValidIndex(ObjectIndex) && Objects[ObjectIndex] && ObjectLength > 0)
 		{
-			Object = Objects[ObjectID];
+			Object = Objects[ObjectIndex];
 
-			int64 ObjectStart = Tell();
+			const int64 ObjectStart = Tell();
 
-			UE_LOG(LogGunfireSaveSystem, VeryVerbose, TEXT("Reading object '%s' [%s]"), *Object->GetName(), *Object->GetClass()->GetName());
+			UE_LOG(LogGunfireSaveSystem, VeryVerbose, TEXT("Reading object '%s' [%s]"),
+				*FNameBuilder(Object->GetFName()), *FNameBuilder(Object->GetClass()->GetFName()));
 
 			Object->Serialize(*this);
 
 			if (Tell() != ObjectStart + ObjectLength)
 			{
-				UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Object '%s' [%s] didn't read all its data"), *Object->GetName(), *Object->GetClass()->GetName());
+				UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Object '%s' [%s] didn't read all its data"),
+					*FNameBuilder(Object->GetFName()), *FNameBuilder(Object->GetClass()->GetFName()));
+
 				Seek(ObjectStart + ObjectLength);
 			}
 		}
@@ -497,7 +455,9 @@ void FSaveGameArchive::ReadBaseObject(UObject* BaseObject)
 		*this << IsActor;
 
 		if (IsActor)
+		{
 			ReadComponents(Cast<AActor>(Object));
+		}
 	}
 
 	Objects.SetNum(0);
@@ -506,8 +466,7 @@ void FSaveGameArchive::ReadBaseObject(UObject* BaseObject)
 void FSaveGameArchive::WriteComponents(AActor* Actor, TMap<FName, bool>& ClassCache)
 {
 	// Write Component Data
-	TInlineComponentArray<UActorComponent*> ActorComponents;
-	Actor->GetComponents(ActorComponents);
+	TInlineComponentArray<UActorComponent*> ActorComponents(Actor);
 
 	int32 ComponentCount = 0;
 
@@ -525,12 +484,14 @@ void FSaveGameArchive::WriteComponents(AActor* Actor, TMap<FName, bool>& ClassCa
 	{
 		if (CheckClassNeedsSaving(ActorComponent->GetClass(), ClassCache))
 		{
-			// Grab the class name and use it as the InKey
-			FString ComponentKey = ActorComponent->GetName();
+			// Grab the class name and use it as the key
+			FName ComponentKey = ActorComponent->GetFName();
 			*this << ComponentKey;
 
-			uint32 ComponentLength = WriteObjectAndLength(ActorComponent);
-			UE_LOG(LogGunfireSaveSystem, VeryVerbose, TEXT("    Component '%s' [%s] - %d bytes"), *ComponentKey, *ActorComponent->GetClass()->GetName(), ComponentLength);
+			const uint32 ComponentLength = WriteObjectAndLength(ActorComponent);
+
+			UE_LOG(LogGunfireSaveSystem, VeryVerbose, TEXT("    Component '%s' [%s] - %d bytes"),
+				*FNameBuilder(ComponentKey), *FNameBuilder(ActorComponent->GetClass()->GetFName()), ComponentLength);
 		}
 	}
 }
@@ -544,11 +505,13 @@ void FSaveGameArchive::ReadComponents(AActor* Actor)
 	TInlineComponentArray<UActorComponent*> ActorComponents;
 
 	if (Actor)
+	{
 		Actor->GetComponents(ActorComponents);
+	}
 
 	for (int i = 0; i < ComponentCount; i++)
 	{
-		FString ComponentKey;
+		FName ComponentKey;
 		*this << ComponentKey;
 
 		uint32 ComponentLength;
@@ -558,11 +521,12 @@ void FSaveGameArchive::ReadComponents(AActor* Actor)
 
 		for (UActorComponent* ActorComponent : ActorComponents)
 		{
-			if (ActorComponent->GetName() == ComponentKey)
+			if (ActorComponent->GetFName() == ComponentKey)
 			{
 				FoundComponent = true;
 
-				UE_LOG(LogGunfireSaveSystem, VeryVerbose, TEXT("  Reading component '%s' [%s]"), *ComponentKey, *ActorComponent->GetClass()->GetName());
+				UE_LOG(LogGunfireSaveSystem, VeryVerbose, TEXT("  Reading component '%s' [%s]"),
+					*FNameBuilder(ComponentKey), *FNameBuilder(ActorComponent->GetClass()->GetFName()));
 
 				ActorComponent->Serialize(*this);
 
@@ -570,11 +534,10 @@ void FSaveGameArchive::ReadComponents(AActor* Actor)
 			}
 		}
 
-		// If we didn't find the named component (got renamed or removed),
-		// just skip over the data.
+		// If we didn't find the named component (got renamed or removed), just skip over the data.
 		if (!FoundComponent)
 		{
-			UE_LOG(LogGunfireSaveSystem, Verbose, TEXT("  Missing component '%s', skipping %d bytes"), *ComponentKey, ComponentLength);
+			UE_LOG(LogGunfireSaveSystem, Verbose, TEXT("  Missing component '%s', skipping %d bytes"), *FNameBuilder(ComponentKey), ComponentLength);
 
 			Seek(Tell() + ComponentLength);
 		}
@@ -613,9 +576,54 @@ bool FSaveGameArchive::CheckClassNeedsSaving(UClass* Class, TMap<FName, bool>& C
 		NeedsSaving = CheckClassNeedsSaving(Class->GetSuperClass(), ClassCache);
 	}
 
-	// Cache the result so we know on future lookups whether this class does or
-	// does not need to be saved
+	// Cache the result so we know on future lookups whether this class does or does not need to be saved
 	ClassCache.Add(Class->GetFName(), NeedsSaving);
 
 	return NeedsSaving;
+}
+
+FArchive& FSaveGameArchive::operator<<(FName& N)
+{
+	constexpr int32 HAS_NUMBER = 1 << 15;
+
+	uint16 Index = 0;
+	int32 Number = 0;
+
+	if (IsSaving())
+	{
+		// Object names are typically just dupes with the number set, so to avoid writing a bunch of duplicate strings
+		// take the number out of the equation.
+		FName NoNumberName = N;
+		Number = NoNumberName.GetNumber();
+		NoNumberName.SetNumber(0);
+
+		Index = NameCache.AddName(NoNumberName);
+
+		// If we ever hit this it's most likely a bug. If it's legit, we'd need to change the index to be 32 bit.
+		ensureMsgf((Index & HAS_NUMBER) == 0, TEXT("More than 32K unique names?"));
+
+		// Most names don't have a number, so to save some space don't write the number and just set the high bit on the
+		// index instead.
+		if (Number != 0)
+		{
+			Index |= HAS_NUMBER;
+		}
+	}
+
+	*this << Index;
+
+	if ((Index & HAS_NUMBER) != 0)
+	{
+		Index &= ~HAS_NUMBER;
+
+		*this << Number;
+	}
+
+	if (IsLoading())
+	{
+		N = NameCache.GetName(Index);
+		N.SetNumber(Number);
+	}
+
+	return *this;
 }

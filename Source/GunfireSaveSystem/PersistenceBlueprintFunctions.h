@@ -2,9 +2,11 @@
 
 #pragma once
 
+#include "PersistenceManager.h"
+
 #include "Kismet/BlueprintAsyncActionBase.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
-#include "PersistenceManager.h"
+
 #include "PersistenceBlueprintFunctions.generated.h"
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FBlueprintCommitSaveResultDelegate, EPersistenceSaveResult, Result);
@@ -55,8 +57,7 @@ class ULoadSaveCallbackProxy : public UPersistenceCallbackProxy
 	GENERATED_BODY()
 
 public:
-	// Sets the current save slot and loads the existing save data if it exists, or
-	// creates new data if it doesn't.
+	// Sets the current save slot and loads the existing save data if it exists, or creates new data if it doesn't.
 	UFUNCTION(BlueprintCallable, Category = "Persistence", meta = (BlueprintInternalUseOnly = "true", WorldContext = "WorldContextObject"))
 	static ULoadSaveCallbackProxy* LoadSave(UObject* WorldContextObject, int32 Slot);
 
@@ -208,7 +209,6 @@ protected:
 	void OnCompleteFunc(bool Result);
 };
 
-
 UCLASS()
 class URestoreProfileBackupCallbackProxy : public UPersistenceCallbackProxy
 {
@@ -253,7 +253,6 @@ protected:
 	void OnCompleteFunc(bool Result);
 };
 
-
 UCLASS()
 class URestoreSlotBackupCallbackProxy : public UPersistenceCallbackProxy
 {
@@ -286,38 +285,39 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Persistence", meta = (WorldContext = "WorldContextObject"))
 	static UPersistenceManager* GetPersistenceManager(const UObject* WorldContextObject);
 
-	// Commit the current save to storage and return immediately.  If you need the result
-	// call Commit Save With Result instead.
+	// Commit the current save to storage and return immediately. If you need the result call Commit Save With Result
+	// instead.
 	UFUNCTION(BlueprintCallable, Category = "Persistence", meta = (WorldContext = "WorldContextObject"))
 	static void CommitSave(const UObject* WorldContextObject, const FString Reason);
 
-	// Gets the current save.  This will return null if a save hasn't been loaded or
-	// created by Load Save.
+	// Gets the current save. This will return null if a save hasn't been loaded or created by Load Save.
 	UFUNCTION(BlueprintCallable, Category = "Persistence", meta = (WorldContext = "WorldContextObject"))
 	static USaveGameWorld* GetCurrentSave(const UObject* WorldContextObject);
 
-	// Gets the profile save.  This will return null if a profile save hasn't been loaded
-	// or created by Load Profile Save.
+	// Gets the profile save. This will return null if a profile save hasn't been loaded or created by Load Profile Save.
 	UFUNCTION(BlueprintCallable, Category = "Persistence", meta = (WorldContext = "WorldContextObject"))
 	static USaveGameProfile* GetProfileSave(const UObject* WorldContextObject);
 
-	// If Disable Commit is true, any commit calls will be ignored.  This is a special
-	// case for situations where saving would break things on load, and it is expected
-	// this will be messaged to the user by disabling any save option in the menu.
+	// If Disable Commit is true, any commit calls will be ignored. This is a special case for situations where saving
+	// would break things on load, and it is expected this will be messaged to the user by disabling any save option in
+	// the menu.
 	UFUNCTION(BlueprintCallable, Category = "Persistence", meta = (WorldContext = "WorldContextObject"))
 	static void SetDisableCommit(const UObject* WorldContextObject, bool DisableCommit);
+
+	// Clear any pending commit locks caused by other objects so that we can save right now no matter what.
+	UFUNCTION(BlueprintCallable, Category = "Persistence", meta = (WorldContext = "WorldContextObject"))
+	static void ClearAllCommitLocks(const UObject* WorldContextObject);
 
 	// Resolve an actor reference from a persistent reference
 	UFUNCTION(BlueprintPure, Category = "Persistence|Reference", meta = (WorldContext = "WorldContextObject"))
 	static AActor* GetReference(const UObject* WorldContextObject, UPARAM(ref) FPersistentReference& Reference);
 
-	// Sets a persistent reference via the actor reference provided. This will only
-	// persist if this actor has a persistence component!
+	// Sets a persistent reference via the actor reference provided. This will only persist if this actor has a
+	// persistence component!
 	UFUNCTION(BlueprintCallable, Category = "Persistence|Reference")
 	static void SetReference(UPARAM(ref) FPersistentReference& Reference, AActor* InActor) { Reference.SetReference(InActor); }
 
-	// Copy data from a reference to another, more efficient than getting and setting the
-	// actor reference.
+	// Copy data from a reference to another, more efficient than getting and setting the actor reference.
 	UFUNCTION(BlueprintCallable, Category = "Persistence|Reference")
 	static void CopyReference(const FPersistentReference& From, UPARAM(ref) FPersistentReference& To) { To.CopyReferenceFrom(From); }
 

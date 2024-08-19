@@ -5,70 +5,74 @@
 #include "Serialization/ObjectAndNameAsStringProxyArchive.h"
 
 //
-// An archive that writes object references (ie, any UObject properties will only have a
-// reference to the object saved, not anything on the object itself), and puts FNames into
-// a lookup table.  This saves space when there are a lot of duplicate FNames being written.
+// A helper for serializing FName's with less waste by only serializing the string once, regardless of how many times
+// it's used.
 //
-// WriteTable must be called after all serialization is done, to write the string table.
-//
-struct FObjectRefAndFNameArchive : public FObjectAndNameAsStringProxyArchive
+struct FNameCache
 {
 public:
-	FObjectRefAndFNameArchive(FArchive& InInnerArchive, bool bInLoadIfFindFails);
+	// Adds a name to the cache and returns a unique id for looking it up on load
+	int32 AddName(const FName& Name);
 
-	virtual ~FObjectRefAndFNameArchive();
+	FName GetName(int32 NameIndex) const;
 
-	virtual FArchive& operator<<(class FName& N) override;
+	void Serialize(FArchive& Archive);
 
-	void WriteTable();
-
-private:
-	void ReadTable();
+	void Reset();
 
 private:
-	int64 InitialOffset;
-	int64 StringTableOffset;
 	TMap<FName, int32> NameMap;
 	TArray<FName> Names;
 };
 
 //
-// An archive that writes only properties with the SaveGame metadata.  It can also handle
-// writing out objects that contain references to other objects.
-// It's only designed to support a single object plus all it's referenced objects, not
-// multiple unrelated objects.
+// An archive that writes only properties with the SaveGame metadata. It can also handle writing out objects that
+// contain references to other objects. It's only designed to support a single object plus all its referenced objects,
+// not multiple unrelated objects.
 //
-struct GUNFIRESAVESYSTEM_API FSaveGameArchive : private FObjectRefAndFNameArchive
+struct GUNFIRESAVESYSTEM_API FSaveGameArchive final : private FObjectAndNameAsStringProxyArchive
 {
 public:
-	FSaveGameArchive(FArchive& InInnerArchive, bool NoDelta = false);
+	// If you're going to be writing multiple save game archives sequentially, you can save space by passing in a shared
+	// name cache instead of letting each archive write their own. It's up to the caller to serialize the shared cache.
+	FSaveGameArchive(FArchive& InInnerArchive, FNameCache* SharedNameCache = nullptr);
 
-	// Call this before ReadBaseObject to get a list of any classes that need to be loaded,
-	// so you can load them in advance.  If you don't do this and any classes are unloaded,
-	// ReadBaseObject will block load them.
+	void SetNoDelta(bool NoDelta) { ArNoDelta = NoDelta; }
+
+	// Call this before ReadBaseObject to get a list of any classes that need to be loaded, so you can load them in
+	// advance. If you don't do this and any classes are unloaded, ReadBaseObject will block load them.
 	bool GetClassesToLoad(TArray<FSoftObjectPath>& ClassesToLoad);
 
-	// These are the only functions exposed, all the individual << serialization operators
-	// are intended for internal use only.
+	// These are the only functions exposed, all the individual << serialization operators are intended for internal use
+	// only.
 	void WriteBaseObject(UObject* BaseObject, TMap<FName, bool>& ClassCache);
 	void ReadBaseObject(UObject* BaseObject);
 
-	using FObjectRefAndFNameArchive::operator<<; // For visibility of the overloads we don't override
-
 private:
+	bool IsSharedNameCache() const { return &NameCache != &LocalNameCache; }
 	uint32 WriteObjectAndLength(UObject* Object);
-	void WriteComponents(class AActor* Actor, TMap<FName, bool>& ClassCache);
-	void ReadComponents(class AActor* Actor);
+	void WriteComponents(AActor* Actor, TMap<FName, bool>& ClassCache);
+	void ReadComponents(AActor* Actor);
+
 	// Returns true if this class has any SaveGame flagged properties
 	bool CheckClassNeedsSaving(UClass* Class, TMap<FName, bool>& ClassCache);
 
-	virtual FArchive& operator<<(class UObject*& Obj) override;
-	virtual FArchive& operator<<(struct FSoftObjectPtr& Value) override;
-	virtual FArchive& operator<<(struct FSoftObjectPath& Value) override;
+	// For visibility of the operators we don't override
+	using FObjectAndNameAsStringProxyArchive::operator<<;
+
+	virtual FArchive& operator<<(UObject*& Obj) override;
+	virtual FArchive& operator<<(FName& N) override;
 
 private:
-	int32 Version;
-	FString TempString;
+	int32 Version = 0;
+	int32 InitialOffset = 0;
+
+	// Unique objects we've serialized
 	TArray<UObject*> Objects;
+
+	// A queue of objects waiting to be serialized
 	TArray<UObject*> ObjectsToSerialize;
+
+	FNameCache& NameCache;
+	FNameCache LocalNameCache;
 };

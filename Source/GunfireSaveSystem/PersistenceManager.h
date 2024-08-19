@@ -46,7 +46,7 @@ class GUNFIRESAVESYSTEM_API UPersistenceSettings : public UObject
 {
 	GENERATED_BODY()
 public:
-	// Should the editor allow persistent saving? Thus not clear out all saves created each time you hit play.
+	// Should the editor allow persistent saving? Or clear out all saves created each time you hit play?
 	UPROPERTY(EditAnywhere, config, Category = "Persistence")
 	bool AllowEditorSaving = false;
 
@@ -63,13 +63,13 @@ class GUNFIRESAVESYSTEM_API UGunfireSaveSystemSettings : public UDeveloperSettin
 public:
 	virtual FName GetCategoryName() const override { return "Plugins"; }
 
-	// The class for world save data.  There can be multiple saves of this type, but only
-	// one will ever be active at a given time.
+	// The class for world save data. There can be multiple saves of this type, but only one will ever be active at a
+	// given time.
 	UPROPERTY(config, EditAnywhere, Category = "Save System")
 	TSoftClassPtr<class USaveGameWorld> SaveGameClass;
 
-	// The class for the profile save data.  There is only one instance of this, and it's
-	// for data that is not associated with a particular save game slot, like unlocks.
+	// The class for the profile save data. There is only one instance of this, and it's for data that is not associated
+	// with a particular save game slot, like unlocks.
 	UPROPERTY(config, EditAnywhere, Category = "Save System")
 	TSoftClassPtr<class USaveGameProfile> SaveProfileClass;
 };
@@ -84,7 +84,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE(FBackgroundWork);
 
 //
 // The persistence manager handles loading and saving persistent world data for a game
-// session.  There is one persistence manager instance hung off the game instance, so it
+// session. There is one persistence manager instance hung off the game instance, so it
 // is created at game start and destroyed at game end.
 //
 UCLASS(config = Engine, defaultconfig)
@@ -93,17 +93,17 @@ class GUNFIRESAVESYSTEM_API UPersistenceManager : public UGameInstanceSubsystem,
 	GENERATED_BODY()
 
 public:
-	// Bind this so the build number can be written to the save file.  If this is
+	// Bind this so the build number can be written to the save file. If this is
 	// implemented it's expect to increase with each new build (ie, the changelist number
 	// or something similar), and if a save with a higher build number than what this
 	// returns is attempted to be loaded it will fail and return that the save is too new
 	// (to help avoid issues with saves from patched builds from being loaded without the
-	// patch).  Leaving this unbound or returning zero will disable the build number checks.
+	// patch). Leaving this unbound or returning zero will disable the build number checks.
 	static FGetBuildNumber GetBuildNumber;
 
 	// Bind this to catch high priority messages that should be displayed to the user,
-	// typically about configuration issues.  This is intended to be used in the editor
-	// to pipe messages to the output window.  If it's unbound the messages will be
+	// typically about configuration issues. This is intended to be used in the editor
+	// to pipe messages to the output window. If it's unbound the messages will be
 	// printed to the log.
 	static FPersistenceUserMessage UserMessage;
 
@@ -120,7 +120,7 @@ public:
 	// slot, like unlocks.
 	void LoadProfileSave(FLoadSaveComplete Callback);
 
-	// Gets the profile save.  This will return null if a profile save hasn't been loaded
+	// Gets the profile save. This will return null if a profile save hasn't been loaded
 	// or created by Load Profile Save.
 	USaveGameProfile* GetProfileSave() const { return UserProfile; }
 
@@ -157,36 +157,36 @@ public:
 
 	int32 GetCurrentSlot() const { return CurrentSlot; }
 
-	// Gets the current save.  This will return null if a save hasn't been loaded or
-	// created by Load Save.
+	// Gets the current save. This will return null if a save hasn't been loaded or created by Load Save.
 	USaveGameWorld* GetCurrentSave() const { return CurrentData; }
 
-	// If Disable Commit is true, any commit calls will be ignored.  This is a special
-	// case for situations where saving would break things on load, and it is expected
-	// this will be messaged to the user by disabling any save option in the menu.
-	void SetDisableCommit(bool DisableCommit);
+	// If Disable Commit is true, any commit calls will be ignored. This is a special case for situations where saving
+	// would break things on load, and it is expected this will be messaged to the user by disabling any save option in
+	// the menu. Each individual context to call into this function will create its own lock, and must be cleared.
+	void SetDisableCommit(bool DisableCommit, const UObject* ContextObject);
+
+	// Unlocks ability to commit and clears any pending locks from all objects.
+	void ClearAllCommitLocks();
 
 	bool AreCommitsDisabled() const { return bDisableCommit; }
 
-	// Deletes all containers in the current save with the specified name, or containing
-	// the specified name.  Useful for situations like level instances that are spawned
-	// dynamically then removed permanently when they're completed.
+	// Deletes all containers in the current save with the specified name, or containing the specified name. Useful for
+	// situations like level instances that are spawned dynamically then removed permanently when they're completed.
 	//
-	// Note: Be very careful with the SubstringMatch option.  If your string isn't unique
-	// enough you could end up removing unrelated containers.
+	// Note: Be very careful with the SubstringMatch option. If your string isn't unique enough you could end up
+	// removing unrelated containers.
 	void DeleteContainers(const FString& ContainerName, bool SubstringMatch);
 
-	// Any persistent actor is guaranteed to have a globally unique key, which can be a
-	// handy way to look them up.  GetActorKey returns a value that can be saved or sent
-	// across the network, and FindActorByKey will find that actor (if they're already
-	// loaded).
+	// Any persistent actor is guaranteed to have a globally unique key, which can be a handy way to look them up.
+	// GetActorKey returns a value that can be saved or sent across the network, and FindActorByKey will find that actor
+	// (if they're already loaded).
 	FPersistenceKey GetActorKey(AActor* Actor) const;
 	AActor* FindActorByKey(FPersistenceKey Key) const;
 
 	bool IsSaving() const { return NumSavesPending > 0; }
 	bool HasPendingSave() const { return NumSavesPending > 1; }
 
-	// Sets the current user index indicating which controller ID profile to save to.
+	// Sets the current user index indicating which controller id profile to save to.
 	void SetUserIndex(int32 Index) { UserIndex = Index; }
 	int32 GetUserIndex() const { return UserIndex; }
 
@@ -211,15 +211,13 @@ public:
 	// Marks a component as destroyed
 	void SetComponentDestroyed(UPersistenceComponent* Component);
 
-	// Special case for persistence components that use a save key instead of being
-	// persisted with their level.  Should be called when the component is being removed
-	// from the world, to catch any unsaved changes.
+	// Special case for persistence components that use a save key instead of being persisted with their level. Should
+	// be called when the component is being removed from the world, to catch any unsaved changes.
 	void WriteComponent(UPersistenceComponent* Component);
 
 	TMap<FName, bool>& GetClassCache() { return ClassCache; }
 
-	// This needs to be called with the old level when a persistent actor is moved to a
-	// new level.
+	// This needs to be called with the old level when a persistent actor is moved to a new level.
 	void OnLevelChanged(UPersistenceComponent* pComponent, ULevel* OldLevel);
 
 	// Checks if dynamic actors have spawned yet for a container
@@ -250,8 +248,7 @@ public:
 	DECLARE_EVENT_OneParam(UPersistenceManager, FSaveEvent, EPersistenceSaveResult)
 	DECLARE_EVENT_OneParam(UPersistenceManager, FDynamicSpawnedEvent, ULevel*)
 
-	// Called before a save starts.  Data on the world or profile save can be updated now
-	// to be included in the new save.
+	// Called before a save starts. Data on the world or profile save can be updated now to be included in the new save.
 	FPreSaveEvent OnPreSaveGame;
 	// Called when a game has been saved
 	FSaveEvent OnSaveGame;
@@ -264,10 +261,9 @@ public:
 	// Called when all persistent dynamic actors for a level have been spawned
 	FDynamicSpawnedEvent OnDynamicSpawned;
 
-	// Called any time a background persistence work (commit, load, delete, etc) is
-	// beginning.  This will only be called once if multiple jobs are running at the same
-	// time, it's intended just for user notification that background work is in progress,
-	// not to catch individual events.
+	// Called any time a background persistence work (commit, load, delete, etc) is beginning. This will only be called
+	// once if multiple jobs are running at the same time, it's intended just for user notification that background work
+	// is in progress, not to catch individual events.
 	UPROPERTY(BlueprintAssignable)
 	FBackgroundWork OnBackgroundWorkBegin;
 
@@ -277,9 +273,6 @@ public:
 
 public:
 	static UPersistenceManager* GetInstance(const UObject* WorldContextObject);
-
-	// Generate a persistent, unique ID.  This is used both at edit and run time.
-	static uint64 GeneratePID(ULevel* pLevel);
 
 	// Serializes all SaveGame tagged properties for an object to/from a blob.
 	void ToBinary(UObject* Object, TArray<uint8>& ObjectBytes);
@@ -302,6 +295,31 @@ protected:
 		RestoreProfileBackup,
 	};
 
+	struct FSaveHeader
+	{
+		int32 Version = 0;
+		uint32 Checksum = 0;
+		int32 Size = 0;
+		int32 BuildNumber = 0;
+		FPackageFileVersion UEVersion;
+		uint32 CustomVersionsOffset = 0;
+		FCustomVersionContainer CustomVersions;
+		FTopLevelAssetPath SaveGameClassPath;
+
+		// Call this first, to preallocate the space for the header
+		void Write(FArchive& Ar);
+
+		// Call this after writing out the save data
+		void Finalize(FArchive& Ar, const TArray<uint8>& SaveBlob);
+
+		// Validates and prepares the save for reading. If this returns success the archive passed in will be ready for
+		// reading the save data from.
+		EPersistenceLoadResult Read(FArchive& Archive, const TArray<uint8>& SaveBlob);
+
+	private:
+		int32 GetChecksumDataStartOffset() const;
+	};
+
 	struct FThreadJob
 	{
 		TWeakObjectPtr<UPersistenceManager> Manager;
@@ -317,13 +335,15 @@ protected:
 	};
 
 	void WriteSave(USaveGame* SaveGame, TArray<uint8>& SaveBlob);
-	bool InitSaveArchive(FArchive& Archive, const TArray<uint8>& SaveBlob, FTopLevelAssetPath& SaveGameClassPath, EPersistenceLoadResult* Result);
 	bool PreloadSave(FThreadJob& Job, const TArray<uint8>& SaveBlob);
-	USaveGame* ReadSave(const TArray<uint8>& SaveBlob, EPersistenceLoadResult* Result = nullptr);
+	USaveGame* ReadSave(const TArray<uint8>& SaveBlob, EPersistenceLoadResult& Result);
+	static bool VerifySaveIntegrity(const TArray<uint8>& SaveBlob, EPersistenceLoadResult& Result);
 	void OnSaveClassesLoaded(FThreadJob* Job);
 
-	void CompressData(TArray<uint8>& SaveBlob);
-	bool DecompressData(TArray<uint8>& SaveBlob);
+	static bool DoesSaveGameExist(const FString& SlotName, const int32 UserIndex, EPersistenceHasResult& OutResult);
+	static bool LoadSaveGame(const FString& SlotName, const int32 UserIndex, TArray<uint8>& Data, EPersistenceLoadResult& OutResult);
+	static bool DoesBackupExist(const FString& SlotName);
+	static bool RestoreBackup(const FString& SlotName);
 
 #if WITH_EDITOR
 	void EditorInit();
@@ -342,10 +362,14 @@ protected:
 	void DeleteSaveDone(const FThreadJob& Job, bool Result);
 	void BackupOperationDone(const FThreadJob& Job, bool Result);
 
-	UPersistenceContainer* GetContainer(const FName& Name, bool CreateIfMissing);
+	UPersistenceContainer* GetContainer(const FName& Name, bool CreateIfMissing) const;
 	inline const FName& GetContainerKey(const UPersistenceComponent* Component) const;
 	bool DeleteContainer(const FName& ContainerName, bool BlockLoadedLevel);
 	void PackContainer(const FName& Name);
+
+#if !UE_BUILD_SHIPPING
+	static FName GetQualifiedContainerKey(const FName& ContainerKey);
+#endif
 
 	USaveGameWorld* CreateSaveGame();
 	USaveGameProfile* CreateSaveProfile();
@@ -373,7 +397,7 @@ protected:
 
 	int32 NumSavesPending = 0;
 
-	// The current save data.  This may include uncommitted changes.
+	// The current save data. This may include uncommitted changes.
 	UPROPERTY(Transient)
 	TObjectPtr<USaveGameWorld> CurrentData = nullptr;
 
@@ -384,9 +408,8 @@ protected:
 	UPROPERTY(Transient)
 	TMap<TObjectPtr<ULevel>, FName> LoadedLevels;
 
-	// All the currently active persistent objects, organized by container. Persistence
-	// components should always unregister themselves before destructing, so we should
-	// never actually have a null pointer in here.
+	// All the currently active persistent objects, organized by container. Persistence components should always
+	// unregister themselves before destructing, so we should never actually have a null pointer in here.
 	TMap<FName, TArray<TWeakObjectPtr<UPersistenceComponent>>> RegisteredActors;
 
 	bool IsCachingUnloads = false;
@@ -397,12 +420,15 @@ protected:
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<ULevel>> CachedLoads;
 
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<const UObject>> CommitLockObjects;
+
 	bool bDisableCommit = false;
 
 	bool bNeverCommit = false;
 
-	// A mapping from UClass names to whether or not they have any persistent data, as an
-	// optimization so we don't have to dig through all the properties each time.
+	// A mapping from UClass names to whether or not they have any persistent data, as an optimization so we don't have
+	// to dig through all the properties each time.
 	TMap<FName, bool> ClassCache;
 
 	int32 NumBackgroundJobs = 0;
@@ -422,8 +448,7 @@ protected:
 		FVector							Offset;
 	};
 
-	// Level offsets can be provided so that actors are persisted without the offsets,
-	// then the offsets are restored when the actors are loaded from persistence.
-	// This allows levels to move around and still persist properly
+	// Level offsets can be provided so that actors are persisted without the offsets, then the offsets are restored
+	// when the actors are loaded from persistence. This allows levels to move around and still persist properly
 	TArray<FLevelOffset> LevelOffsets;
 };

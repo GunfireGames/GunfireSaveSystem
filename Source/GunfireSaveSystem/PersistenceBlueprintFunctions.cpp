@@ -67,7 +67,7 @@ void ULoadSaveCallbackProxy::Activate()
 
 void ULoadSaveCallbackProxy::OnComplete(EPersistenceLoadResult Result, USaveGame* SaveGame)
 {
-	if (Result == EPersistenceLoadResult::Success || Result == EPersistenceLoadResult::DoesNotExist)
+	if (Result == EPersistenceLoadResult::Success || Result == EPersistenceLoadResult::Restored || Result == EPersistenceLoadResult::DoesNotExist)
 	{
 		OnSuccess.Broadcast(Result, Cast<USaveGameWorld>(SaveGame), Slot);
 	}
@@ -100,7 +100,7 @@ void ULoadProfileSaveCallbackProxy::Activate()
 
 void ULoadProfileSaveCallbackProxy::OnComplete(EPersistenceLoadResult Result, USaveGame* SaveGame)
 {
-	if (Result == EPersistenceLoadResult::Success || Result == EPersistenceLoadResult::DoesNotExist)
+	if (Result == EPersistenceLoadResult::Success || Result == EPersistenceLoadResult::Restored || Result == EPersistenceLoadResult::DoesNotExist)
 	{
 		OnSuccess.Broadcast(Result, SaveGame);
 	}
@@ -134,7 +134,7 @@ void UReadSaveCallbackProxy::Activate()
 
 void UReadSaveCallbackProxy::OnComplete(EPersistenceLoadResult Result, USaveGame* SaveGame)
 {
-	if (Result == EPersistenceLoadResult::Success)
+	if (Result == EPersistenceLoadResult::Success || Result == EPersistenceLoadResult::Restored)
 	{
 		OnSuccess.Broadcast(Result, Cast<USaveGameWorld>(SaveGame), Slot);
 	}
@@ -144,7 +144,7 @@ void UReadSaveCallbackProxy::OnComplete(EPersistenceLoadResult Result, USaveGame
 	}
 }
 
-//////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 UHasSaveCallbackProxy* UHasSaveCallbackProxy::HasSave(UObject* WorldContextObject, int32 Slot)
 {
@@ -171,7 +171,7 @@ void UHasSaveCallbackProxy::OnCompleteFunc(EPersistenceHasResult Result)
 	OnComplete.Broadcast(Result);
 }
 
-//////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 UDeleteSaveCallbackProxy* UDeleteSaveCallbackProxy::DeleteSave(UObject* WorldContextObject, int32 Slot)
 {
@@ -205,7 +205,7 @@ void UDeleteSaveCallbackProxy::OnComplete(bool Result)
 	}
 }
 
-//////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 UDeleteProfileSaveCallbackProxy* UDeleteProfileSaveCallbackProxy::DeleteProfileSave(UObject* WorldContextObject)
 {
@@ -238,7 +238,7 @@ void UDeleteProfileSaveCallbackProxy::OnComplete(bool Result)
 	}
 }
 
-//////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 UHasProfileBackupCallbackProxy* UHasProfileBackupCallbackProxy::HasProfileBackup(UObject* WorldContextObject)
 {
@@ -271,7 +271,7 @@ void UHasProfileBackupCallbackProxy::OnCompleteFunc(bool Result)
 	}
 }
 
-//////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 URestoreProfileBackupCallbackProxy* URestoreProfileBackupCallbackProxy::RestoreProfileBackup(UObject* WorldContextObject)
 {
@@ -304,7 +304,7 @@ void URestoreProfileBackupCallbackProxy::OnCompleteFunc(bool Result)
 	}
 }
 
-//////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 UHasSlotBackupCallbackProxy* UHasSlotBackupCallbackProxy::HasSlotBackup(UObject* WorldContextObject, int32 Slot)
 {
@@ -338,7 +338,7 @@ void UHasSlotBackupCallbackProxy::OnCompleteFunc(bool Result)
 	}
 }
 
-//////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 URestoreSlotBackupCallbackProxy* URestoreSlotBackupCallbackProxy::RestoreSlotBackup(UObject* WorldContextObject, int32 Slot)
 {
@@ -372,7 +372,7 @@ void URestoreSlotBackupCallbackProxy::OnCompleteFunc(bool Result)
 	}
 }
 
-//////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 UPersistenceManager* UPersistenceBlueprintFunctionLibrary::GetPersistenceManager(const UObject* WorldContextObject)
 {
@@ -411,7 +411,15 @@ void UPersistenceBlueprintFunctionLibrary::SetDisableCommit(const UObject* World
 {
 	if (UPersistenceManager* PersistenceManager = UPersistenceManager::GetInstance(WorldContextObject))
 	{
-		PersistenceManager->SetDisableCommit(DisableCommit);
+		PersistenceManager->SetDisableCommit(DisableCommit, WorldContextObject);
+	}
+}
+
+void UPersistenceBlueprintFunctionLibrary::ClearAllCommitLocks(const UObject* WorldContextObject)
+{
+	if (UPersistenceManager* PersistenceManager = UPersistenceManager::GetInstance(WorldContextObject))
+	{
+		PersistenceManager->ClearAllCommitLocks();
 	}
 }
 

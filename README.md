@@ -21,11 +21,6 @@ Saving and Loading
 
 To save/load/query the saves use the blueprint functions in the Persistence category. Most of the blueprint functions are async, so you'll need to wait for the results. You can also call the functions directly in UPersistenceManager.
 
-TODO
-----
-
-The GunfireSaveSystem currently depends on having all levels use a custom level script actor to store the next persistence id. You could accomplish the same thing by adding a special actor to the level that stores the current value, or ideally just get rid of that requirement completely and scan through the level on load to find the current max and cache that.
-
 Engine Modifications
 --------------------
 
@@ -89,46 +84,3 @@ In UWorld::AddToWorld, modify the block "if (bExecuteNextStep && !Level->IsFinis
 		}
 		// @Gunfire End
 	}
-
-Optionally, you can define a CreateDefaultSaveGameSystem callback, so you can better control where savegames go on Windows.
-
-In SaveGameSystem.h, add the following to ISaveGameSystem:
-
-	// @Gunfire Begin
-	// Adding a way to override the default save game system for platforms that fall back
-	// to the generic one. This needs to be hooked before the first call to
-	// IPlatformFeaturesModule::GetSaveGameSystem. The pointer will never be deleted, so
-	// you're expected to return a static instance, or expect that it'll leak on shutdown.
-	DECLARE_DELEGATE_RetVal(ISaveGameSystem*, FCreateDefaultSaveGameSystem);
-	static FCreateDefaultSaveGameSystem CreateDefaultSaveGameSystem;
-	// @Gunfire End
-
-Then in PlatformFeatures.cpp modify GetSaveGameSystem to this:
-
-	// @Gunfire - It's kind of crappy to put this here, but SaveGameSystem doesn't have a cpp
-	ISaveGameSystem::FCreateDefaultSaveGameSystem ISaveGameSystem::CreateDefaultSaveGameSystem;
-
-	ISaveGameSystem* IPlatformFeaturesModule::GetSaveGameSystem()
-	{
-		// @Gunfire Begin
-		static ISaveGameSystem* DefaultSaveGame = nullptr;
-
-		if (DefaultSaveGame == nullptr)
-		{
-			if (ISaveGameSystem::CreateDefaultSaveGameSystem.IsBound())
-			{
-				DefaultSaveGame = ISaveGameSystem::CreateDefaultSaveGameSystem.Execute();
-			}
-
-			if (DefaultSaveGame == nullptr)
-			{
-				static FGenericSaveGameSystem GenericSaveGame;
-				DefaultSaveGame = &GenericSaveGame;
-			}
-		}
-
-		return DefaultSaveGame;
-		// @Gunfire End
-	}
-
-Once you've done that you can go into WindowsSaveGameSystem.h and set USE_WINDOWS_SAVEGAMESYSTEM to 1 when PLATFORM_WINDOWS is defined. This will redirect Steam and EOS savegames to be in the Windows "Saved Games", and give you a hook where you can do things like put games in a subfolder based on the Steam user profile id.

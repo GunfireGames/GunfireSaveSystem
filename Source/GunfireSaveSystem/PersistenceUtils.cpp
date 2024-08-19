@@ -8,16 +8,16 @@ DEFINE_LOG_CATEGORY(LogGunfireSaveSystem);
 
 bool UPersistenceUtils::HasModifiedSaveProperties(AActor* Actor)
 {
-	if (!Actor)
+	if (Actor == nullptr)
+	{
 		return false;
+	}
 
 	bool HasNonDefaultSaveValues = HasModifiedSaveProperties(Actor->GetClass(), Actor);
 
 	if (!HasNonDefaultSaveValues)
 	{
-		TInlineComponentArray<UActorComponent*> Components(Actor);
-
-		for (UActorComponent* Component : Components)
+		for (UActorComponent* Component : TInlineComponentArray<UActorComponent*>(Actor))
 		{
 			HasNonDefaultSaveValues = HasModifiedSaveProperties(Component->GetClass(), Component);
 
@@ -31,12 +31,16 @@ bool UPersistenceUtils::HasModifiedSaveProperties(AActor* Actor)
 
 bool UPersistenceUtils::HasModifiedSaveProperties(UClass* Class, UObject* Obj)
 {
-	if (!Class)
+	if (Class == nullptr)
+	{
 		return false;
+	}
 
 	// We only care about object instances, not default objects
 	if (Obj->HasAnyFlags(RF_ClassDefaultObject | RF_ArchetypeObject))
+	{
 		return false;
+	}
 
 	bool HasNonDefault = false;
 	UObject* DiffObject = Obj->GetArchetype();

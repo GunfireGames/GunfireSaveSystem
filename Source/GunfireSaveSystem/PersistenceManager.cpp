@@ -9,20 +9,22 @@
 #include "SaveGameProfile.h"
 #include "SaveGameWorld.h"
 
-#include "LevelScriptActorGunfire.h"
+#include "WindowsSaveGameSystem.h"
 
 #include "Async/Async.h"
 #include "Engine/AssetManager.h"
 #include "Engine/Engine.h"
+#include "Engine/LevelScriptActor.h"
 #include "Engine/LevelStreaming.h"
 #include "HAL/RunnableThread.h"
-#include "Kismet/GameplayStatics.h"
 #include "PlatformFeatures.h"
 #include "SaveGameSystem.h"
-#include "Serialization/ArchiveLoadCompressedProxy.h"
-#include "Serialization/ArchiveSaveCompressedProxy.h"
 #include "Serialization/MemoryReader.h"
 #include "Serialization/MemoryWriter.h"
+
+#if WITH_EDITOR
+# include "Internationalization/Regex.h"
+#endif
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(PersistenceManager)
 
@@ -43,13 +45,11 @@ DECLARE_CYCLE_STAT(TEXT("Decompress Save"), STAT_PersistenceGunfire_DecompressSa
 
 // For debugging latency issues that only affect platforms with slow save systems
 TAutoConsoleVariable<float> CVarPersistenceJobDelay(TEXT("SaveSystem.JobDelay"), 0.f, TEXT("If this is greater than zero, all async persistence jobs will be delayed for that many seconds"), ECVF_Cheat);
-TAutoConsoleVariable<int32> CVarPersistenceDebug(TEXT("SaveSystem.Debug"), 0, TEXT(""), ECVF_Cheat);
+TAutoConsoleVariable<int32> CVarPersistenceDebug(TEXT("SaveSystem.Debug"), 0, TEXT("Prints on-screen messages about save operations"), ECVF_Cheat);
 
-// This version number is for changes to the persistence format at the top level.  The
-// persistence containers have their own version, since they aren't guaranteed to be
-// resaved each time the save game is (they may not be unpacked and repacked).  Bumping
-// this doesn't cause savegames to be invalidated, it can be used for backwards compatible
-// changes.
+// This version number is for changes to the persistence format at the top level. The persistence containers have their
+// own version, since they aren't guaranteed to be resaved each time the save game is (they may not be unpacked and
+// repacked). Bumping this doesn't cause savegames to be invalidated, it can be used for backwards compatible changes.
 //
 // Version History
 // 1: Initial version
@@ -61,9 +61,10 @@ TAutoConsoleVariable<int32> CVarPersistenceDebug(TEXT("SaveSystem.Debug"), 0, TE
 // 7: Switched to FTopLevelAssetPath for save game class reference
 // 8: Stripped UE version from containers
 // 9: Added compression to the final blob
-static const int32 GUNFIRE_PERSISTENCE_VERSION = 9;
+// 10: Switched persistent ids from 64 bit ints to guids (not backwards compatible)
+static const int32 GUNFIRE_PERSISTENCE_VERSION = 10;
 
-//////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 AActor* FPersistentReference::GetReference(UWorld* World)
 {
@@ -112,7 +113,7 @@ void FPersistentReference::ClearReference()
 	Key = FPersistenceKey();
 }
 
-///////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 FGetBuildNumber UPersistenceManager::GetBuildNumber;
 FPersistenceUserMessage UPersistenceManager::UserMessage;
@@ -149,14 +150,12 @@ UPersistenceManager::UPersistenceManager()
 		FWorldDelegates::LevelActorsInitialized.AddUObject(this, &ThisClass::OnLevelActorsInitialized);
 
 #if PLATFORM_XSX
-		// On Xbox we should get the background event when the app is suspended, which is a
-		// good time to save.
+		// On Xbox we should get the background event when the app is suspended, which is a good time to save.
 		FCoreDelegates::ApplicationWillEnterBackgroundDelegate.AddUObject(this, &ThisClass::OnSuspend);
 #elif PLATFORM_PS5
-		// PlayStation doesn't have an event for when the app is suspended, so trigger a
-		// save any time it goes into the background (ie, they hit the PS button).
-		// If they hold the PS button and pick close application from the quick menu
-		// there's nothing we can do though, they'll lose any unsaved progress.
+		// PlayStation doesn't have an event for when the app is suspended, so trigger a save any time it goes into the
+		// background (ie, they hit the PS button). If they hold the PS button and pick close application from the quick
+		// menu there's nothing we can do though, they'll lose any unsaved progress.
 		FCoreDelegates::ApplicationWillDeactivateDelegate.AddUObject(this, &ThisClass::OnSuspend);
 #endif
 
@@ -257,9 +256,9 @@ void UPersistenceManager::LoadProfileSave(FLoadSaveComplete Callback)
 
 void UPersistenceManager::LoadProfileSaveDone(const FThreadJob& Job, EPersistenceLoadResult Result)
 {
-	if (Result == EPersistenceLoadResult::Success)
+	if (Result == EPersistenceLoadResult::Success || Result == EPersistenceLoadResult::Restored)
 	{
-		UserProfile = Cast<USaveGameProfile>(ReadSave(Job.ProfileData, &Result));
+		UserProfile = Cast<USaveGameProfile>(ReadSave(Job.ProfileData, Result));
 	}
 	else if (Result == EPersistenceLoadResult::DoesNotExist)
 	{
@@ -304,9 +303,9 @@ void UPersistenceManager::LoadSave(int32 Slot, FLoadSaveComplete Callback)
 
 void UPersistenceManager::LoadSaveDone(const FThreadJob& Job, EPersistenceLoadResult Result)
 {
-	if (Result == EPersistenceLoadResult::Success)
+	if (Result == EPersistenceLoadResult::Success || Result == EPersistenceLoadResult::Restored)
 	{
-		CurrentData = Cast<USaveGameWorld>(ReadSave(Job.WorldData, &Result));
+		CurrentData = Cast<USaveGameWorld>(ReadSave(Job.WorldData, Result));
 	}
 	else if (Result == EPersistenceLoadResult::DoesNotExist)
 	{
@@ -330,9 +329,9 @@ void UPersistenceManager::ReadSaveDone(const FThreadJob& Job, EPersistenceLoadRe
 {
 	USaveGameWorld* SaveGame = nullptr;
 
-	if (Result == EPersistenceLoadResult::Success)
+	if (Result == EPersistenceLoadResult::Success || Result == EPersistenceLoadResult::Restored)
 	{
-		SaveGame = Cast<USaveGameWorld>(ReadSave(Job.WorldData, &Result));
+		SaveGame = Cast<USaveGameWorld>(ReadSave(Job.WorldData, Result));
 	}
 
 	Job.LoadCallback.ExecuteIfBound(Result, SaveGame);
@@ -381,7 +380,7 @@ void UPersistenceManager::CommitSave(const FString& Reason, FCommitSaveComplete 
 
 	if (bNeverCommit)
 	{
-		UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Committing saves is disabled for this play session.  Restart the application to reset."));
+		UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Committing saves is disabled for this play session. Restart the application to reset."));
 		Callback.ExecuteIfBound(EPersistenceSaveResult::Disabled);
 		return;
 	}
@@ -395,9 +394,9 @@ void UPersistenceManager::CommitSave(const FString& Reason, FCommitSaveComplete 
 
 	UE_CLOG(NumSavesPending > 0, LogGunfireSaveSystem, Warning, TEXT("Committing save while %d save(s) still pending, queueing"), NumSavesPending);
 
-	// If IsEngineExitRequested returns true we've already had EndPlay called on actors,
-	// so we can potentially get incomplete save data.  Ignore the save in this case,
-	// something should have already committed a save earlier than this.
+	// If IsEngineExitRequested returns true we've already had EndPlay called on actors, so we can potentially get
+	// incomplete save data. Ignore the save in this case, something should have already committed a save earlier than
+	// this.
 	if (IsEngineExitRequested())
 	{
 		UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Ignoring CommitSave during shutdown"));
@@ -406,6 +405,10 @@ void UPersistenceManager::CommitSave(const FString& Reason, FCommitSaveComplete 
 	}
 
 	++NumSavesPending;
+
+#if !NO_LOGGING
+	const double CommitStartTime = FPlatformTime::Seconds();
+#endif
 
 	FThreadJob* Job = new FThreadJob;
 	Job->Type = EJobType::Commit;
@@ -428,19 +431,17 @@ void UPersistenceManager::CommitSave(const FString& Reason, FCommitSaveComplete 
 
 		TArray<FName, TInlineAllocator<16>> EmptyContainers;
 
-		// Go through all currently in use containers and have their actors write their
-		// latest save data.
-		for (auto It = RegisteredActors.CreateIterator(); It; ++It)
+		// Go through all currently in use containers and have their actors write their latest save data.
+		for (auto It : RegisteredActors)
 		{
-			const FName& ContainerName = It.Key();
-			TArray<TWeakObjectPtr<UPersistenceComponent>>& Components = It.Value();
+			const FName& ContainerName = It.Key;
+			TArray<TWeakObjectPtr<UPersistenceComponent>>& Components = It.Value;
 
 			UPersistenceContainer* Container = GetContainer(ContainerName, false);
 
-			// If we've got registered components for this container, write them out
-			// now.  It's possible to have a container with nothing to save if all the
-			// actors using it were moved to another container, or they were deleted
-			// and don't persist being destroyed.
+			// If we've got registered components for this container, write them out now. It's possible to have a
+			// container with nothing to save if all the actors using it were moved to another container, or they were
+			// deleted and don't persist being destroyed.
 			if (Components.Num() > 0 || (Container && Container->HasDestroyed()))
 			{
 				if (!Container)
@@ -450,8 +451,7 @@ void UPersistenceManager::CommitSave(const FString& Reason, FCommitSaveComplete 
 
 				Container->WriteData(Components, *this);
 			}
-			// If a container is unused, don't bother writing anything for it and flag
-			// it for deletion.
+			// If a container is unused, don't bother writing anything for it and flag it for deletion.
 			else
 			{
 				EmptyContainers.Add(ContainerName);
@@ -463,7 +463,7 @@ void UPersistenceManager::CommitSave(const FString& Reason, FCommitSaveComplete 
 		{
 			if (DeleteContainer(ContainerName, false))
 			{
-				UE_LOG(LogGunfireSaveSystem, Log, TEXT("Deleting container '%s' because it's unused"), *ContainerName.ToString());
+				UE_LOG(LogGunfireSaveSystem, Log, TEXT("Deleting container '%s' because it's unused"), *FNameBuilder(ContainerName));
 			}
 		}
 
@@ -478,7 +478,7 @@ void UPersistenceManager::CommitSave(const FString& Reason, FCommitSaveComplete 
 			}
 			else
 			{
-				UE_LOG(LogGunfireSaveSystem, Log, TEXT("CommitSave CurrentSlot == -1  Bypassing WriteSave()"));
+				UE_LOG(LogGunfireSaveSystem, Log, TEXT("CommitSave CurrentSlot == -1, bypassing WriteSave"));
 			}
 		}
 	}
@@ -488,12 +488,18 @@ void UPersistenceManager::CommitSave(const FString& Reason, FCommitSaveComplete 
 		UserProfile->PreCommit(this);
 		UserProfile->PreCommitNative(this);
 
-		// If we have profile data, always save it along with the world, 
-		// even if you are a client connected to a servers game.
+		// If we have profile data, always save it along with the world, even if you are a client connected to a servers
+		// game.
 		WriteSave(UserProfile, Job->ProfileData);
 	}
 
-	UE_LOG(LogGunfireSaveSystem, Log, TEXT("Commit save done, pushing to thread"));
+#if !NO_LOGGING
+	const double CommitEndTime = FPlatformTime::Seconds();
+	UE_LOG(LogGunfireSaveSystem, Log, TEXT("Commit save done, world save %d KB, profile save %d KB, took %d ms. Pushing to thread"),
+		Job->WorldData.Num() / 1024,
+		Job->ProfileData.Num() / 1024,
+		static_cast<int32>((CommitEndTime - CommitStartTime) * 1000.0));
+#endif
 
 	QueueJob(Job);
 }
@@ -559,10 +565,35 @@ void UPersistenceManager::BackupOperationDone(const FThreadJob& Job, bool Result
 	Job.DeleteCallback.ExecuteIfBound(Result);
 }
 
-void UPersistenceManager::SetDisableCommit(bool DisableCommit)
+void UPersistenceManager::SetDisableCommit(bool DisableCommit, const UObject* ContextObject)
 {
-	UE_LOG(LogGunfireSaveSystem, Display, TEXT("%s commit"), DisableCommit ? TEXT("Disabling") : TEXT("Enabling"));
-	bDisableCommit = DisableCommit;
+	if (!ContextObject)
+	{
+		UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Invalid context object when trying to disable or enable commits"));
+		return;
+	}
+	
+	UE_LOG(LogGunfireSaveSystem, Display, TEXT("%s commit via %s"), DisableCommit ? TEXT("Disabling") : TEXT("Enabling"), *ContextObject->GetName());
+
+	if (DisableCommit)
+	{
+		CommitLockObjects.AddUnique(ContextObject);
+	}
+	else
+	{
+		CommitLockObjects.Remove(ContextObject);
+	}
+
+	bDisableCommit = (CommitLockObjects.Num() > 0);
+
+	UE_LOG(LogGunfireSaveSystem, Display, TEXT("Commits: %s Locks = %d"), bDisableCommit ? TEXT("Disabled") : TEXT("Enabled"), CommitLockObjects.Num());
+}
+
+void UPersistenceManager::ClearAllCommitLocks()
+{
+	UE_LOG(LogGunfireSaveSystem, Display, TEXT("%s commit"), TEXT("Enabling by Force"));
+	CommitLockObjects.Empty();
+	bDisableCommit = false;
 }
 
 USaveGameWorld* UPersistenceManager::CreateSaveGame()
@@ -601,8 +632,8 @@ USaveGameProfile* UPersistenceManager::CreateSaveProfile()
 		SaveProfileClass = Settings->SaveProfileClass.LoadSynchronous();
 	}
 
-	// A save profile has no purpose if there isn't a derived class that has added data,
-	// so log a warning and return null if it's requested in that case.
+	// A save profile has no purpose if there isn't a derived class that has added data, so log a warning and return
+	// null if it's requested in that case.
 	if (SaveProfileClass == nullptr)
 	{
 		UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Save Profile Class not specified, profile will be null"));
@@ -618,18 +649,17 @@ void UPersistenceManager::DeleteContainers(const FString& ContainerName, bool Su
 	{
 		if (SubstringMatch)
 		{
-			FString CurContainerName;
-
 			for (int i = CurrentData->Containers.Num() - 1; i >= 0; i--)
 			{
 				UPersistenceContainer* Container = CurrentData->Containers[i];
 
-				Container->GetKey().ToString(CurContainerName);
+				FNameBuilder CurContainerBuilder(Container->GetKey());
+				FStringView CurContainerName = CurContainerBuilder.ToView();
 
-				if (SubstringMatch ? CurContainerName.Contains(ContainerName) : ContainerName == CurContainerName)
+				if (SubstringMatch ? CurContainerName.Contains(ContainerName) : CurContainerName == ContainerName)
 				{
 					UE_LOG(LogGunfireSaveSystem, Log, TEXT("Deleting container '%s' based on request '%s'"),
-						*Container->GetKey().ToString(), *ContainerName);
+						*CurContainerBuilder, *ContainerName);
 
 					DeleteContainer(Container->GetKey(), true);
 				}
@@ -647,14 +677,13 @@ void UPersistenceManager::DeleteContainers(const FString& ContainerName, bool Su
 FPersistenceKey UPersistenceManager::GetActorKey(AActor* Actor) const
 {
 	FPersistenceKey Key;
-	Key.PersistentID = UPersistenceComponent::INVALID_UID;
 
 	if (Actor)
 	{
 		if (UPersistenceComponent* Component = Actor->FindComponentByClass<UPersistenceComponent>())
 		{
 			Key.ContainerKey = GetContainerKey(Component);
-			Key.PersistentID = Component->UniqueID;
+			Key.PersistentId = Component->UniqueId;
 		}
 	}
 
@@ -663,12 +692,22 @@ FPersistenceKey UPersistenceManager::GetActorKey(AActor* Actor) const
 
 AActor* UPersistenceManager::FindActorByKey(FPersistenceKey Key) const
 {
-	if (const TArray<TWeakObjectPtr<UPersistenceComponent>>* Components = RegisteredActors.Find(Key.ContainerKey))
+	const TArray<TWeakObjectPtr<UPersistenceComponent>>* Components = RegisteredActors.Find(Key.ContainerKey);
+
+#if !UE_BUILD_SHIPPING
+	if (Components == nullptr)
+	{
+		const FName QualifiedContainerKey = GetQualifiedContainerKey(Key.ContainerKey);
+		Components = RegisteredActors.Find(QualifiedContainerKey);
+	}
+#endif
+
+	if (Components != nullptr)
 	{
 		for (const TWeakObjectPtr<UPersistenceComponent>& Component : *Components)
 		{
 			const UPersistenceComponent* RawComponent = Component.Get();
-			if (RawComponent->UniqueID == Key.PersistentID)
+			if (RawComponent->UniqueId == Key.PersistentId)
 			{
 				return RawComponent->GetOwner();
 			}
@@ -717,7 +756,9 @@ void UPersistenceManager::Unregister(UPersistenceComponent* pComponent, ULevel* 
 	{
 		const FName* OverrideContainerKey = LoadedLevels.Find(OverrideLevel);
 		if (ensure(OverrideContainerKey))
+		{
 			ContainerKey = *OverrideContainerKey;
+		}
 	}
 	else
 	{
@@ -730,8 +771,8 @@ void UPersistenceManager::Unregister(UPersistenceComponent* pComponent, ULevel* 
 
 		if (!pComponent->SaveKey.IsNone())
 		{
-			// If this component uses a save key there will never be a level unload to
-			// clear the registered actor and pack the container, so go ahead and do it now.
+			// If this component uses a save key there will never be a level unload to clear the registered actor and
+			// pack the container, so go ahead and do it now.
 			PackContainer(ContainerKey);
 		}
 
@@ -777,18 +818,22 @@ UPersistenceContainer* UPersistenceManager::GetContainer(const UPersistenceCompo
 
 	if (!Component->GetWorld()->IsNetMode(NM_Client))
 	{
-		FName ContainerKey = GetContainerKey(Component);
+		const FName ContainerKey = GetContainerKey(Component);
 		if (ContainerKey == NAME_None)
 		{
-			// Due to a ULevelStreaming living longer than its child ULevel, 
-			// we can encounter timing issues in World Composition levels when a 
-			// level is rapidly toggled to be loaded and then unloaded. 
+			// Due to a ULevelStreaming living longer than its child ULevel, we can encounter timing issues in World
+			// Composition levels when a level is rapidly toggled to be loaded and then unloaded. 
 			ULevel* NewLevel = Component->GetComponentLevel();
 			if (IsValid(Component) && NewLevel != nullptr)
 			{
+				// Levels generated at runtime by WorldPartition to be used as cells don't have a LevelScriptActor
+				const FName LevelName = NewLevel->IsWorldPartitionRuntimeCell() ?
+					NewLevel->GetPackage()->GetFName() :
+					NewLevel->GetLevelScriptActor()->GetFName();
+
 				UE_LOG(LogGunfireSaveSystem, Warning,
 					TEXT("UPersistenceManager - Encountering level '%s', containing actor '%s', not previously hit by ULevel::OnLevelLoaded"),
-					*Component->GetComponentLevel()->GetLevelScriptActor()->GetName(),
+					*FNameBuilder(LevelName),
 					*Component->GetOwner()->GetName());
 
 				LoadedLevels.Emplace(NewLevel, FName(*Component->GetComponentLevel()->GetPathName()));
@@ -801,7 +846,7 @@ UPersistenceContainer* UPersistenceManager::GetContainer(const UPersistenceCompo
 		// so go ahead and do it now.
 		if (Container && !Component->SaveKey.IsNone() && Container->IsPacked())
 		{
-			UE_LOG(LogGunfireSaveSystem, Log, TEXT("UPersistenceManager - Forcing unpack for container '%s'"), *Container->GetKey().ToString());
+			UE_LOG(LogGunfireSaveSystem, Log, TEXT("UPersistenceManager - Forcing unpack for container '%s'"), *FNameBuilder(Container->GetKey()));
 
 			Container->Unpack();
 		}
@@ -814,6 +859,8 @@ void UPersistenceManager::SetComponentDestroyed(UPersistenceComponent* Component
 {
 	if (UPersistenceContainer* Container = GetContainer(GetContainerKey(Component), true))
 	{
+		UE_LOG(LogGunfireSaveSystem, Verbose, TEXT("UPersistenceManager - Setting component destroyed for container '%s'"), *FNameBuilder(Container->GetKey()));
+
 		Container->SetDestroyed(Component);
 	}
 }
@@ -837,12 +884,12 @@ void UPersistenceManager::WriteComponent(UPersistenceComponent* Component)
 
 void UPersistenceManager::OnLevelChanged(UPersistenceComponent* pComponent, ULevel* OldLevel)
 {
-	// First, check if we should persist and don't have a save key.  If we've got a save
-	// key we go into a special container, so we don't care what level we're in.
+	// First, check if we should persist and don't have a save key. If we've got a save key we go into a special
+	// container, so we don't care what level we're in.
 	if (pComponent->ShouldPersist() && pComponent->SaveKey.IsNone())
 	{
-		// Dynamic unique ID's are unique to the entire savegame, so we don't need to
-		// generate a new one.  We don't support moving static persistent data though.
+		// Dynamic unique id's are unique to the entire savegame, so we don't need to generate a new one. We don't
+		// support moving static persistent data though.
 		if (!pComponent->IsDynamic)
 		{
 			OutputUserMessage(
@@ -852,10 +899,9 @@ void UPersistenceManager::OnLevelChanged(UPersistenceComponent* pComponent, ULev
 			return;
 		}
 
-		// If the container is packed it's not going to be saved again after this actor
-		// has been removed, which means it'll be duped next time we load that level.
-		// If this ever gets hit the solution is probably to get the actor moved over to
-		// the new level sooner.
+		// If the container is packed it's not going to be saved again after this actor has been removed, which means
+		// it'll be duped next time we load that level. If this ever gets hit the solution is probably to get the actor
+		// moved over to the new level sooner.
 		if (const FName* LevelKey = LoadedLevels.Find(OldLevel))
 		{
 			if (UPersistenceContainer* Container = GetContainer(*LevelKey, false))
@@ -886,9 +932,6 @@ void UPersistenceManager::ToBinary(UObject* Object, TArray<uint8>& ObjectBytes)
 {
 	FMemoryWriter MemoryWriter(ObjectBytes, true);
 
-	FPackageFileVersion PackageFileUEVersion = GPackageFileUEVersion;
-	MemoryWriter << PackageFileUEVersion;
-
 	FSaveGameArchive Ar(MemoryWriter);
 	Ar.WriteBaseObject(Object, ClassCache);
 }
@@ -900,174 +943,144 @@ void UPersistenceManager::FromBinary(UObject* Object, const TArray<uint8>& Objec
 
 	FMemoryReader MemoryReader(ObjectBytes, true);
 
-	FPackageFileVersion PackageFileUEVersion;
-	MemoryReader << PackageFileUEVersion;
-
-	// If the UE5 version is incorrect then assume we have saved data from the deprecated
-	// UE4 version type which was just an int32. Repair the state of the reader by backing
-	// up 4 bytes before continuing.
-	if ((uint32)PackageFileUEVersion.FileVersionUE5 < (uint32)EUnrealEngineObjectUE5Version::INITIAL_VERSION ||
-		(uint32)PackageFileUEVersion.FileVersionUE5 > (uint32)EUnrealEngineObjectUE5Version::AUTOMATIC_VERSION)
-	{
-		PackageFileUEVersion.FileVersionUE5 = 0;
-		int64 FixedReaderPos = MemoryReader.Tell() - 4;
-		MemoryReader.Seek(FixedReaderPos);
-	}
-
 	FSaveGameArchive Ar(MemoryReader);
 	Ar.ReadBaseObject(Object);
 }
 
-// Convert the save game to a binary format. 
+void UPersistenceManager::FSaveHeader::Write(FArchive& Ar)
+{
+	Ar << Version;
+	Ar << Checksum;
+	Ar << Size;
+	Ar << BuildNumber;
+	Ar << UEVersion;
+	Ar << CustomVersionsOffset;
+	Ar << SaveGameClassPath;
+}
+
+void UPersistenceManager::FSaveHeader::Finalize(FArchive& Ar, const TArray<uint8>& SaveBlob)
+{
+	CustomVersionsOffset = static_cast<uint32>(SaveBlob.Num());
+	Ar.Seek(CustomVersionsOffset);
+
+	// Write out the custom versions.
+	CustomVersions = Ar.GetCustomVersions();
+	CustomVersions.Serialize(Ar);
+
+	Size = SaveBlob.Num();
+
+	// Write the header again before we calculate the checksum, so it'll be the final data for what the checksum is
+	// based on
+	Ar.Seek(0);
+	Write(Ar);
+
+	Checksum = FCrc::MemCrc32(SaveBlob.GetData() + GetChecksumDataStartOffset(), Size - GetChecksumDataStartOffset());
+
+	// Now write the final data
+	Ar.Seek(0);
+	Write(Ar);
+}
+
+EPersistenceLoadResult UPersistenceManager::FSaveHeader::Read(FArchive& Archive, const TArray<uint8>& SaveBlob)
+{
+	Archive << Version;
+
+	// We didn't bother making version 10 changes backwards compatible
+	if (Version < 10)
+	{
+		return EPersistenceLoadResult::Corrupt;
+	}
+
+	if (Version > GUNFIRE_PERSISTENCE_VERSION)
+	{
+		UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Save version is %d, ours is %d, refusing to load"), Version, GUNFIRE_PERSISTENCE_VERSION);
+
+		return EPersistenceLoadResult::TooNew;
+	}
+
+	Archive << Checksum;
+
+	check(Archive.Tell() == GetChecksumDataStartOffset());
+
+	Archive << Size;
+
+	// Some platforms will return extra padding bytes on load, so we write out the actual size we wrote. If it's greater
+	// than the amount of data read in it must be corrupt though.
+	if (Size > SaveBlob.Num())
+	{
+		return EPersistenceLoadResult::Corrupt;
+	}
+
+	const uint32 CalculatedCRC = FCrc::MemCrc32(SaveBlob.GetData() + GetChecksumDataStartOffset(), Size - GetChecksumDataStartOffset());
+
+	if (CalculatedCRC != Checksum)
+	{
+		UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Save CRC didn't match (saved: 0x%x, calculated: 0x%x), refusing to load"), Checksum, CalculatedCRC);
+
+		return EPersistenceLoadResult::Corrupt;
+	}
+
+	Archive << BuildNumber;
+
+	const int32 CurrentBuildNumber = GetBuildNumber.IsBound() ? GetBuildNumber.Execute() : 0;
+
+	// Just because the build number is newer doesn't mean anything in the save format has changed, but to be safe we
+	// won't load it.
+	if (CurrentBuildNumber != 0 && BuildNumber > CurrentBuildNumber)
+	{
+		UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Save build number is %d, ours is %d, refusing to load"), BuildNumber, CurrentBuildNumber);
+
+		return EPersistenceLoadResult::TooNew;
+	}
+
+	Archive << UEVersion;
+	Archive.SetUEVer(UEVersion);
+
+	Archive << CustomVersionsOffset;
+
+	Archive << SaveGameClassPath;
+
+	const int64 DataStart = Archive.Tell();
+
+	Archive.Seek(CustomVersionsOffset);
+
+	CustomVersions.Serialize(Archive);
+	Archive.SetCustomVersions(CustomVersions);
+
+	Archive.Seek(DataStart);
+
+	return EPersistenceLoadResult::Success;
+}
+
+int32 UPersistenceManager::FSaveHeader::GetChecksumDataStartOffset() const
+{
+	// We want to checksum everything after the checksum value
+	return 8;
+}
+
 void UPersistenceManager::WriteSave(USaveGame* SaveGame, TArray<uint8>& SaveBlob)
 {
 	SaveBlob.Reset();
 
 	FMemoryWriter MemoryWriter(SaveBlob, true);
 
-	// The CRC and size are the first thing in the save, stub out the space for them.
-	uint32 CRC = 0;
-	int32 Size = 0;
-	MemoryWriter << CRC;
-	MemoryWriter << Size;
+	FSaveHeader Header;
+	Header.Version = GUNFIRE_PERSISTENCE_VERSION;
+	Header.BuildNumber = GetBuildNumber.IsBound() ? GetBuildNumber.Execute() : 0;
+	Header.UEVersion = GPackageFileUEVersion;
+	Header.SaveGameClassPath = SaveGame->GetClass()->GetClassPathName();
 
-	// Write version for this file format
-	int32 SavegameFileVersion = GUNFIRE_PERSISTENCE_VERSION;
-	MemoryWriter << SavegameFileVersion;
+	// Write out a copy of the header to save the space. We'll come back with the final values later.
+	Header.Write(MemoryWriter);
 
-	// Write out the build number
-	int32 BuildNumber = 0;
-	if (GetBuildNumber.IsBound())
+	// Write the savegame
 	{
-		BuildNumber = GetBuildNumber.Execute();
-	}
-	MemoryWriter << BuildNumber;
-
-	// Write out engine and UE version information
-	FPackageFileVersion PackageFileUEVersion = GPackageFileUEVersion;
-	MemoryWriter << PackageFileUEVersion;
-
-	// Write the class path so we know what class to load
-	FTopLevelAssetPath SaveGameClassPath = SaveGame->GetClass()->GetClassPathName();
-	MemoryWriter << SaveGameClassPath;
-
-	FSaveGameArchive Ar(MemoryWriter);
-	Ar.WriteBaseObject(SaveGame, ClassCache);
-
-	// Write out the actual size before we calculate the checksum
-	MemoryWriter.Seek(4);
-	Size = SaveBlob.Num();
-
-	// Seek back to the start and rewrite the checksum with the actual value
-	MemoryWriter << Size;
-	MemoryWriter.Seek(0);
-	CRC = FCrc::MemCrc32(SaveBlob.GetData() + 4, SaveBlob.Num() - 4);
-	MemoryWriter << CRC;
-}
-
-bool UPersistenceManager::InitSaveArchive(FArchive& Archive, const TArray<uint8>& SaveBlob, FTopLevelAssetPath& SaveGameClassPath, EPersistenceLoadResult* Result)
-{
-	// Read the CRC from the start of the save
-	uint32 SavedCRC = 0;
-	Archive << SavedCRC;
-
-	int32 SavedSize = 0;
-	Archive << SavedSize;
-
-	// Some platforms will return extra padding bytes on load, so we write out the actual
-	// size we wrote.  If it's greater than the amount of data read in or less than the
-	// minimum size it must be corrupt though.
-	if (SavedSize > SaveBlob.Num() || SavedSize <= 8)
-	{
-		if (Result)
-		{
-			*Result = EPersistenceLoadResult::Corrupt;
-		}
-
-		return false;
+		FSaveGameArchive Ar(MemoryWriter);
+		Ar.WriteBaseObject(SaveGame, ClassCache);
 	}
 
-	uint32 CalculatedCRC = FCrc::MemCrc32(SaveBlob.GetData() + 4, SavedSize - 4);
-
-	if (CalculatedCRC != SavedCRC)
-	{
-		UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Save CRC didn't match (saved: 0x%x, calculated: 0x%x), refusing to load"), SavedCRC, CalculatedCRC);
-
-		if (Result)
-		{
-			*Result = EPersistenceLoadResult::Corrupt;
-		}
-
-		return false;
-	}
-
-	int32 SavegameFileVersion;
-	Archive << SavegameFileVersion;
-
-	if (SavegameFileVersion > GUNFIRE_PERSISTENCE_VERSION)
-	{
-		UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Save version is %d, ours is %d, refusing to load"), SavegameFileVersion, GUNFIRE_PERSISTENCE_VERSION);
-
-		if (Result)
-		{
-			*Result = EPersistenceLoadResult::TooNew;
-		}
-
-		return false;
-	}
-
-	int32 BuildNumber;
-	Archive << BuildNumber;
-
-	int32 CurrentBuildNumber = 0;
-	if (GetBuildNumber.IsBound())
-	{
-		CurrentBuildNumber = GetBuildNumber.Execute();
-	}
-
-	// Just because the build number is newer doesn't mean anything in the save format has
-	// changed, but to be safe we won't load it.
-	if (CurrentBuildNumber != 0 && BuildNumber > CurrentBuildNumber)
-	{
-		UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Save build number is %d, ours is %d, refusing to load"), BuildNumber, CurrentBuildNumber);
-
-		if (Result)
-		{
-			*Result = EPersistenceLoadResult::TooNew;
-		}
-
-		return false;
-	}
-
-	// Unreal 5 has changed the archive version to be a struct. For previous saves, we
-	// convert the old integer to this new struct.
-	FPackageFileVersion SavedUEVersion;
-	if (SavegameFileVersion < 6)
-	{
-		int32 SavedUE4Version;
-		Archive << SavedUE4Version;
-		SavedUEVersion = FPackageFileVersion::CreateUE4Version((EUnrealEngineObjectUE4Version)SavedUE4Version);
-	}
-	else
-	{
-		Archive << SavedUEVersion;
-	}
-
-	Archive.SetUEVer(SavedUEVersion);
-
-	// Get the class path
-	if (SavegameFileVersion >= 7)
-	{
-		Archive << SaveGameClassPath;
-	}
-	else
-	{
-		FString OldClassPath;
-		Archive << OldClassPath;
-		SaveGameClassPath.TrySetPath(OldClassPath);
-	}
-
-	return true;
+	// Now that everything is written, finalize the save, which will also rewrite the header
+	Header.Finalize(MemoryWriter, SaveBlob);
 }
 
 bool UPersistenceManager::PreloadSave(FThreadJob& Job, const TArray<uint8>& SaveBlob)
@@ -1080,19 +1093,20 @@ bool UPersistenceManager::PreloadSave(FThreadJob& Job, const TArray<uint8>& Save
 	// Load raw data from memory
 	FMemoryReader MemoryReader(SaveBlob, true);
 
-	FTopLevelAssetPath SaveGameClassPath;
+	FSaveHeader Header;
+	EPersistenceLoadResult Result = Header.Read(MemoryReader, SaveBlob);
 
-	if (!InitSaveArchive(MemoryReader, SaveBlob, SaveGameClassPath, nullptr))
+	if (Result != EPersistenceLoadResult::Success)
 	{
 		return false;
 	}
 
 	TArray<FSoftObjectPath> ClassesToLoad;
 
-	UClass* SaveGameClass = FindObject<UClass>(SaveGameClassPath);
+	UClass* SaveGameClass = FindObject<UClass>(Header.SaveGameClassPath);
 	if (SaveGameClass == nullptr)
 	{
-		ClassesToLoad.Add(FSoftObjectPath(SaveGameClassPath));
+		ClassesToLoad.Add(FSoftObjectPath(Header.SaveGameClassPath));
 	}
 
 	FSaveGameArchive Ar(MemoryReader);
@@ -1136,88 +1150,7 @@ void UPersistenceManager::OnSaveClassesLoaded(FThreadJob* Job)
 	});
 }
 
-void UPersistenceManager::CompressData(TArray<uint8>& SaveBlob)
-{
-	SCOPE_CYCLE_COUNTER(STAT_PersistenceGunfire_CompressSave);
-
-	// Copy header data (up to savegame version so we can determine if its compressed)
-	TArray<uint8> HeaderBlob;
-	HeaderBlob.Append(SaveBlob.GetData(), 12);
-
-	// Remove the header so that our buffer is 100% compressed
-	TArray<uint8> UncompressedBlob = SaveBlob;
-	UncompressedBlob.RemoveAt(0, 12);
-
-	// Apply Zlib decompression
-	SaveBlob.Reset();
-	FArchiveSaveCompressedProxy Compressor = FArchiveSaveCompressedProxy(SaveBlob, NAME_Zlib);
-
-	int32 UncompressedSize = UncompressedBlob.Num();
-	Compressor.Serialize(&UncompressedSize, 4);
-
-	Compressor.Serialize(UncompressedBlob.GetData(), UncompressedSize);
-	Compressor.Flush();
-
-	// Add the header data back
-	SaveBlob.Insert(HeaderBlob, 0);
-	SaveBlob.Shrink();
-}
-
-bool UPersistenceManager::DecompressData(TArray<uint8>& SaveBlob)
-{
-	if (SaveBlob.Num() < 12)
-	{
-		return false;
-	}
-
-	FMemoryReader MemoryReader(SaveBlob, true);
-	MemoryReader.Seek(8);
-
-	int32 SavegameFileVersion;
-	MemoryReader << SavegameFileVersion;
-
-	// Is this a compressed save?
-	if (SavegameFileVersion <= 8)
-	{
-		return true;
-	}
-
-	SCOPE_CYCLE_COUNTER(STAT_PersistenceGunfire_DecompressSave);
-
-	// Copy header data (up to savegame version so we can determine if its compressed)
-	TArray<uint8> HeaderBlob;
-	HeaderBlob.Append(SaveBlob.GetData(), 12);
-
-	// Remove the header so that our buffer is 100% compressed
-	TArray<uint8> CompressedBlob = SaveBlob;
-	CompressedBlob.RemoveAt(0, 12);
-
-	// Apply Zlib compression
-	SaveBlob.Reset();
-	FArchiveLoadCompressedProxy Decompresser(CompressedBlob, NAME_Zlib);
-
-	if (Decompresser.IsError())
-	{
-		return false;
-	}
-
-	int32 UncompressedSize = 0;
-	Decompresser.Serialize(&UncompressedSize, 4);
-
-	SaveBlob.Reserve(UncompressedSize + HeaderBlob.Num());
-	SaveBlob.SetNum(UncompressedSize);
-
-	Decompresser.Serialize(SaveBlob.GetData(), UncompressedSize);
-	Decompresser.Flush();
-
-	// Add the header data back
-	SaveBlob.Insert(HeaderBlob, 0);
-	SaveBlob.Shrink();
-
-	return true;
-}
-
-USaveGame* UPersistenceManager::ReadSave(const TArray<uint8>& SaveBlob, EPersistenceLoadResult* Result)
+USaveGame* UPersistenceManager::ReadSave(const TArray<uint8>& SaveBlob, EPersistenceLoadResult& Result)
 {
 	if (SaveBlob.Num() == 0)
 	{
@@ -1227,65 +1160,90 @@ USaveGame* UPersistenceManager::ReadSave(const TArray<uint8>& SaveBlob, EPersist
 	// Load raw data from memory
 	FMemoryReader MemoryReader(SaveBlob, true);
 
-	FTopLevelAssetPath SaveGameClassPath;
+	// If this save has been restored, be sure to return that same status on success.
+	const bool bRestoredFromBackup = (Result == EPersistenceLoadResult::Restored);
 
-	if (!InitSaveArchive(MemoryReader, SaveBlob, SaveGameClassPath, Result))
+	FSaveHeader Header;
+	Result = Header.Read(MemoryReader, SaveBlob);
+	if (Result != EPersistenceLoadResult::Success)
 	{
 		return nullptr;
 	}
 
 	// Try to find it, and failing that, load it
-	UClass* SaveGameClass = FindObject<UClass>(SaveGameClassPath);
+	UClass* SaveGameClass = FindObject<UClass>(Header.SaveGameClassPath);
 	if (SaveGameClass == nullptr)
 	{
-		SaveGameClass = LoadObject<UClass>(nullptr, *SaveGameClassPath.ToString());
+		SaveGameClass = LoadObject<UClass>(nullptr, *Header.SaveGameClassPath.ToString());
 	}
 
-	// If we have a class, try to load it.
-	if (SaveGameClass != nullptr)
+	// If we didn't come up with a save game class, error out
+	if (SaveGameClass == nullptr)
 	{
-		USaveGame* SaveGame = NewObject<USaveGame>(GetTransientPackage(), SaveGameClass);
+		UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Save game class couldn't be found: %s"), *Header.SaveGameClassPath.ToString());
 
-		FSaveGameArchive Ar(MemoryReader);
-		Ar.ReadBaseObject(SaveGame);
-
-		if (Result)
-		{
-			*Result = EPersistenceLoadResult::Success;
-		}
-
-		return SaveGame;
-	}
-	else
-	{
-		UE_LOG(LogGunfireSaveSystem, Warning, TEXT("Save game class couldn't be found: %s"), *SaveGameClassPath.ToString());
-
-		if (Result)
-		{
-			*Result = EPersistenceLoadResult::Corrupt;
-		}
-
+		Result = EPersistenceLoadResult::Corrupt;
+	
 		return nullptr;
 	}
+
+	USaveGame* SaveGame = NewObject<USaveGame>(GetTransientPackage(), SaveGameClass);
+
+	FSaveGameArchive Ar(MemoryReader);
+	Ar.ReadBaseObject(SaveGame);
+
+	Result = bRestoredFromBackup ? EPersistenceLoadResult::Restored : EPersistenceLoadResult::Success;
+
+	return SaveGame;
 }
 
-UPersistenceContainer* UPersistenceManager::GetContainer(const FName& Name, bool CreateIfMissing)
+bool UPersistenceManager::VerifySaveIntegrity(const TArray<uint8>& SaveBlob, EPersistenceLoadResult& Result)
+{
+	// If no data exists at all, assume the save is corrupt.
+	if (SaveBlob.Num() == 0)
+	{
+		Result = EPersistenceLoadResult::Corrupt;
+		return false;
+	}
+
+	// Load raw data from memory
+	FMemoryReader MemoryReader(SaveBlob, true);
+
+	FSaveHeader Header;
+	Result = Header.Read(MemoryReader, SaveBlob);
+
+	return (Result == EPersistenceLoadResult::Success);
+}
+
+UPersistenceContainer* UPersistenceManager::GetContainer(const FName& Name, bool CreateIfMissing) const
 {
 	if (CurrentData != nullptr)
 	{
+#if !UE_BUILD_SHIPPING
+		const FName QualifiedContainerKey = GetQualifiedContainerKey(Name);
+#endif
+
 		for (UPersistenceContainer* Container : CurrentData->Containers)
 		{
-			// Encountering a null container originating from an old / invalid save.  
+			// Encountering a null container originating from an old / invalid save.
 			if (Container == nullptr)
 			{
 				UE_LOG(LogGunfireSaveSystem, Error, TEXT("Null container encountered in current save data: '%s'"), *Name.ToString());
 				continue;
 			}
 
-			if (Container->GetKey() == Name)
+			const FName& ContainerKey = Container->GetKey();
+			if (ContainerKey == Name)
 			{
 				return Container;
 			}
+
+#if !UE_BUILD_SHIPPING
+			if (ContainerKey == QualifiedContainerKey)
+			{
+				return Container;
+			}
+#endif
 		}
 
 		if (CreateIfMissing)
@@ -1348,10 +1306,9 @@ bool UPersistenceManager::DeleteContainer(const FName& ContainerName, bool Block
 
 				Container->MarkAsGarbage();
 
-				// If we have a level loaded for this container, remove it from our list.
-				// That way we won't recreate the container we just deleted if a save is
-				// triggered before the level unloads.  If the level is unloaded and then
-				// loaded again it will save though.
+				// If we have a level loaded for this container, remove it from our list. That way we won't recreate the
+				// container we just deleted if a save is triggered before the level unloads. If the level is unloaded
+				// and then loaded again it will save though.
 				if (BlockLoadedLevel)
 				{
 					for (auto It = LoadedLevels.CreateIterator(); It; ++It)
@@ -1374,8 +1331,7 @@ bool UPersistenceManager::DeleteContainer(const FName& ContainerName, bool Block
 
 void UPersistenceManager::PackContainer(const FName& LevelKey)
 {
-	// This container should be done being used at this point, so pack it until it's
-	// needed again.
+	// This container should be done being used at this point, so pack it until it's needed again.
 	if (UPersistenceContainer* Container = GetContainer(LevelKey, false))
 	{
 		Container->Pack();
@@ -1392,6 +1348,42 @@ void UPersistenceManager::PackContainer(const FName& LevelKey)
 	// Remove the registered actors array for this container (should be empty at this point)
 	RegisteredActors.Remove(LevelKey);
 }
+
+#if !UE_BUILD_SHIPPING
+
+FName UPersistenceManager::GetQualifiedContainerKey(const FName& ContainerKey)
+{
+	// There will be some extra qualifiers on container names (e.g. UEDPIE_0_) when in the editor. This is fine for
+	// saves generated from within the editor, however, if you bring save over from the cooked build, those level names
+	// will not contain these qualifiers and won't be found in the save data. We account for this by building a
+	// sanitized version of the provided container name to use as a fallback which will allow the editor to load both
+	// editor saves and regular game saves.
+
+	const FRegexPattern RegexPattern(TEXT("(UEDPIE_\\d+_)"));
+	FRegexMatcher RegexMatcher(RegexPattern, ContainerKey.ToString());
+	if (RegexMatcher.FindNext())
+	{
+		FString SanitizedContainerKey = ContainerKey.ToString();
+
+		do
+		{
+			FString MatchString = RegexMatcher.GetCaptureGroup(0);
+			SanitizedContainerKey = SanitizedContainerKey.Replace(*MatchString, TEXT(""));
+		}
+		while (RegexMatcher.FindNext());
+
+		return *SanitizedContainerKey;
+	}
+	else
+	{
+		// Because we have no world context, just assume the first pie instance is loading the saves.
+		constexpr int32 PIEInstance = 0;
+		const FString EditorQualifiedContainerKey = UWorld::ConvertToPIEPackageName(ContainerKey.ToString(), PIEInstance);
+		return *EditorQualifiedContainerKey;
+	}
+}
+
+#endif
 
 void UPersistenceManager::OnLevelAddedToWorld(ULevel* Level, UWorld* World)
 {
@@ -1423,28 +1415,27 @@ void UPersistenceManager::OnLevelPostLoad(ULevel* Level, UWorld* World)
 {
 	UE_LOG(LogGunfireSaveSystem, VeryVerbose, TEXT("UPersistenceManager - Level Loaded '%s'"), *Level->GetPathName());
 
-	// During initial world load we'll get this callback before the game instance is set,
-	// so we can't tell if it's our world or not.  Cache it off until later.
+	// During initial world load we'll get this callback before the game instance is set, so we can't tell if it's our
+	// world or not. Cache it off until later.
 	if (World->GetGameInstance() == nullptr)
 	{
 		CachedLoads.Add(Level);
 	}
 	else
 	{
-		// Always check if this is actually our world.  In PIE this callback will come in
-		// for all instances.
+		// Always check if this is actually our world. In PIE this callback will come in for all instances.
 		if (GetInstance(World) == this)
 		{
 			ensure(LoadedLevels.Find(Level) == nullptr);
 
-			// Cache off the level key so we don't have to keep recomputing it every time an
-			// actor from this level is used.
+			// Cache off the level key, so we don't have to keep recomputing it every time an actor from this level is
+			// used.
 			const FName LevelKey(*Level->GetPathName());
 			LoadedLevels.Add(Level) = LevelKey;
 
 			if (UPersistenceContainer* Container = GetContainer(LevelKey, false))
 			{
-				if (!Container->IsUnPacked())
+				if (!Container->IsUnpacked())
 				{
 					Container->Unpack();
 					Container->PreloadDynamicActors(Level, *this);
@@ -1461,8 +1452,8 @@ void UPersistenceManager::OnPreWorldInitialization(UWorld* World, const UWorld::
 
 void UPersistenceManager::OnCanLevelActorsInitialize(ULevel* Level, UWorld* World, bool& CanInitialize)
 {
-	// The engine is ready to finish loading this level.  If we aren't done loading
-	// dynamic actors for the level, ask it to wait.
+	// The engine is ready to finish loading this level. If we aren't done loading dynamic actors for the level, ask it
+	// to wait.
 	if (GetInstance(World) == this && !World->IsNetMode(NM_Client))
 	{
 		// We can get into this case if the world is torn down before it finishes loading up (network error or
@@ -1519,7 +1510,8 @@ void UPersistenceManager::OnLevelActorsInitialized(ULevel* Level, UWorld* World)
 
 void UPersistenceManager::OnLevelPreRemoveFromWorld(ULevel* Level, UWorld* World)
 {
-	UE_LOG(LogGunfireSaveSystem, Verbose, TEXT("Level pre-remove from world '%s'"), Level ? *Level->GetLevelScriptActor()->GetName() : *World->GetName());
+	UE_LOG(LogGunfireSaveSystem, Verbose, TEXT("Level pre-remove from world '%s'"),
+		(Level && Level->GetLevelScriptActor()) ? *FNameBuilder(Level->GetLevelScriptActor()->GetFName()) : *FNameBuilder(World ? World->GetFName() : NAME_None));
 
 	ProcessCachedLoads();
 
@@ -1528,8 +1520,8 @@ void UPersistenceManager::OnLevelPreRemoveFromWorld(ULevel* Level, UWorld* World
 		// It's possible to not have a save in the editor so account for that here.
 		if (CurrentData != nullptr)
 		{
-			// We're about to remove a level from the world.  Before anything gets removed force a
-			// save for all persistent actors.
+			// We're about to remove a level from the world. Before anything gets removed force a save for all
+			// persistent actors.
 			const FName* LevelKey = LoadedLevels.Find(Level);
 			if (LevelKey)
 			{
@@ -1537,9 +1529,8 @@ void UPersistenceManager::OnLevelPreRemoveFromWorld(ULevel* Level, UWorld* World
 				{
 					bool WriteContainer = true;
 
-					// If we don't have any actors registered anymore and we don't have any
-					// destroyed actors to persist we don't need this container anymore
-					// and can remove it.
+					// If we don't have any actors registered anymore and we don't have any destroyed actors to persist
+					// we don't need this container anymore and can remove it.
 					if (Components->Num() == 0)
 					{
 						UPersistenceContainer* Container = GetContainer(*LevelKey, false);
@@ -1550,7 +1541,7 @@ void UPersistenceManager::OnLevelPreRemoveFromWorld(ULevel* Level, UWorld* World
 
 							if (DeleteContainer(*LevelKey, true))
 							{
-								UE_LOG(LogGunfireSaveSystem, Log, TEXT("Deleting container '%s' on level unload because it's unused"), *LevelKey->ToString());
+								UE_LOG(LogGunfireSaveSystem, Log, TEXT("Deleting container '%s' on level unload because it's unused"), *FNameBuilder(*LevelKey));
 							}
 						}
 					}
@@ -1576,8 +1567,7 @@ void UPersistenceManager::OnLevelRemovedFromWorld(ULevel* Level, UWorld* World)
 
 	if (GetInstance(World) == this)
 	{
-		// If Level is null the entire world is getting removed, so pack all containers for
-		// that world.
+		// If Level is null the entire world is getting removed, so pack all containers for that world.
 		if (Level == nullptr)
 		{
 			for (auto It = LoadedLevels.CreateIterator(); It; ++It)
@@ -1633,9 +1623,8 @@ void UPersistenceManager::OnPreLoadMap(const FString& MapURL)
 
 	check(!IsCachingUnloads);
 
-	// In UEngine::LoadMap the LevelRemovedFromWorld notification is sent before all the
-	// actors have had EndPlay called on them.  To work around that, when a map is loading
-	// we cache all the unloads until the cleanup phase.
+	// In UEngine::LoadMap the LevelRemovedFromWorld notification is sent before all the actors have had EndPlay called
+	// on them. To work around that, when a map is loading we cache all the unloads until the cleanup phase.
 	IsCachingUnloads = true;
 }
 
@@ -1651,8 +1640,8 @@ void UPersistenceManager::OnWorldCleanup(UWorld* World, bool bSessionEnded, bool
 {
 	ProcessCachedLoads();
 
-	// At this point all the actors from the world being unloaded should have written
-	// their info and been destroyed, so cleanup the level containers now.
+	// At this point all the actors from the world being unloaded should have written their info and been destroyed, so
+	// cleanup the level containers now.
 	if (IsCachingUnloads)
 	{
 		IsCachingUnloads = false;
@@ -1666,9 +1655,8 @@ void UPersistenceManager::OnWorldCleanup(UWorld* World, bool bSessionEnded, bool
 		}
 		else
 		{
-			// Assume that there won't be a case where we'll run world cleanup for
-			// multiple instances at the same time.  If this triggers something is
-			// probably wrong.
+			// Assume that there won't be a case where we'll run world cleanup for multiple instances at the same time.
+			// If this triggers something is probably wrong.
 			check(CachedUnloads.Num() == 0);
 		}
 
@@ -1678,8 +1666,7 @@ void UPersistenceManager::OnWorldCleanup(UWorld* World, bool bSessionEnded, bool
 
 void UPersistenceManager::OnSuspend()
 {
-	// If we're getting suspended, trigger a save now.  We may be terminated at any point
-	// after this.
+	// If we're getting suspended, trigger a save now. We may be terminated at any point after this.
 	UE_LOG(LogGunfireSaveSystem, Log, TEXT("Forcing save during suspend"));
 	CommitSave(TEXT("Suspend"));
 }
@@ -1694,8 +1681,8 @@ void UPersistenceManager::ProcessCachedLoads()
 
 		if (CachedLevel->OwningWorld->GetGameInstance() != nullptr)
 		{
-			// It's possible a load snuck in and registered this before we processed the
-			// cache, so if it's already there just skip it.
+			// It's possible a load snuck in and registered this before we processed the cache, so if it's already there
+			// just skip it.
 			if (LoadedLevels.Find(CachedLevel) == nullptr)
 			{
 				OnLevelPostLoad(CachedLevel, CachedLevel->OwningWorld);
@@ -1707,8 +1694,7 @@ void UPersistenceManager::ProcessCachedLoads()
 	}
 }
 
-//////////////////////////////////////////////////////////////////////////////////////////
-//////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 UPersistenceManager* UPersistenceManager::GetInstance(const UObject* WorldContextObject)
 {
@@ -1726,51 +1712,7 @@ UPersistenceManager* UPersistenceManager::GetInstance(const UObject* WorldContex
 	return nullptr;
 }
 
-uint64 UPersistenceManager::GeneratePID(ULevel* pLevel)
-{
-	uint64 uid = UPersistenceComponent::INVALID_UID;
-
-	if (pLevel != nullptr)
-	{
-		UWorld* pWorld = pLevel->GetWorld();
-		check(pWorld);
-
-#if WITH_EDITOR
-		// If we're in the editor and not in PIE, generate a persistent id from the level
-		if (!pWorld->IsGameWorld())
-		{
-			if (ALevelScriptActorGunfire* pLevelActor = Cast<ALevelScriptActorGunfire>(pLevel->GetLevelScriptActor()))
-			{
-				uid = pLevelActor->GenerateUniqueID();
-			}
-		}
-		else
-#endif
-		{
-			// At runtime, generate a persistent id off of the save game
-			if (UPersistenceManager* Persistence = GetInstance(pWorld))
-			{
-				if (USaveGameWorld* pWorkingSave = Persistence->GetCurrentSave())
-				{
-					uid = pWorkingSave->GenerateUniqueID();
-				}
-			}
-		}
-
-		if (uid == UPersistenceComponent::INVALID_UID)
-		{
-			OutputUserMessage(
-				TEXT("Failed to find unique ID generator.  Check that the game instance inherits from ")
-				TEXT("UGameInstanceGunfire and that the LevelScriptActor inherits from ALevelScriptActorGunfire."),
-				pLevel);
-		}
-	}
-
-	return uid;
-}
-
-////////////////////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void UPersistenceManager::SetLevelOffset(class ULevelStreaming* Level, const FVector& Offset)
 {
@@ -1814,8 +1756,7 @@ void UPersistenceManager::QueueJob(FThreadJob* Job)
 {
 	check(IsInGameThread());
 
-	// If a bunch of background work is being queued, only send out a begin for the
-	// first one.
+	// If a bunch of background work is being queued, only send out a begin for the first one.
 	if (++NumBackgroundJobs == 1)
 	{
 		OnBackgroundWorkBegin.Broadcast();
@@ -1826,6 +1767,7 @@ void UPersistenceManager::QueueJob(FThreadJob* Job)
 		Job->Manager = this;
 		ThreadJobs.Add(Job);
 	}
+
 	ThreadHasWork->Trigger();
 }
 
@@ -1864,9 +1806,9 @@ uint32 UPersistenceManager::Run()
 	{
 		FThreadJob* Job = nullptr;
 
-		// Pop a job off the thread queue, if we don't have one already.  If we're waiting
-		// for an async task to push results on the main thread HasRunningThreadJob will
-		// be non-null, in which case we want to sleep, so we leave Job null.
+		// Pop a job off the thread queue, if we don't have one already. If we're waiting for an async task to push
+		// results on the main thread HasRunningThreadJob will be non-null, in which case we want to sleep, so we leave
+		// Job null.
 		{
 			FScopeLock Lock(&ThreadJobsLock);
 			if (!HasRunningThreadJob && ThreadJobs.Num() > 0)
@@ -1883,18 +1825,17 @@ uint32 UPersistenceManager::Run()
 			continue;
 		}
 
-		// For debugging we support delaying the persistence jobs, to flush out any issues
-		// where game code isn't waiting for a job to finish.
-		float JobDelay = CVarPersistenceJobDelay.GetValueOnAnyThread();
+		// For debugging we support delaying the persistence jobs, to flush out any issues where game code isn't waiting
+		// for a job to finish.
+		const float JobDelay = CVarPersistenceJobDelay.GetValueOnAnyThread();
 		if (JobDelay > 0.f)
 		{
 			FPlatformProcess::Sleep(JobDelay);
 		}
 
-		// Process the job on the thread, then queue an async task to dispatch the results
-		// on the game thread.  If the game shuts down while the async task is waiting to
-		// be dispatched the persistence manager pointer will be null, so we don't bother
-		// with callbacks in that case and just delete the job.
+		// Process the job on the thread, then queue an async task to dispatch the results on the game thread. If the
+		// game shuts down while the async task is waiting to be dispatched the persistence manager pointer will be
+		// null, so we don't bother with callbacks in that case and just delete the job.
 		switch (Job->Type)
 		{
 		case EJobType::Commit:
@@ -1903,15 +1844,12 @@ uint32 UPersistenceManager::Run()
 
 				if (Job->WorldData.Num() > 0)
 				{
-					CompressData(Job->WorldData);
-
 					const FString SlotName = GetSlotName(Job->Slot);
 					Ret = SaveSystem->SaveGame(false, *SlotName, UserIndex, Job->WorldData);
 				}
 
 				if (Ret && Job->ProfileData.Num() > 0)
 				{
-					CompressData(Job->ProfileData);
 					Ret = SaveSystem->SaveGame(false, SAVE_PROFILE_NAME, UserIndex, Job->ProfileData);
 				}
 
@@ -1926,126 +1864,104 @@ uint32 UPersistenceManager::Run()
 			}
 			break;
 
-		case EJobType::LoadSlot:
-		case EJobType::LoadProfile:
-		case EJobType::ReadSlot:
 		case EJobType::HasSlot:
 			{
 				const bool IsProfile = (Job->Type == EJobType::LoadProfile);
 				const FString SlotName = IsProfile ? SAVE_PROFILE_NAME : GetSlotName(Job->Slot);
 
-				ISaveGameSystem::ESaveExistsResult Exists;
+				EPersistenceHasResult Result;
+				DoesSaveGameExist(*SlotName, UserIndex, Result);
 
-				Exists = SaveSystem->DoesSaveGameExistWithResult(*SlotName, UserIndex);
-
-				if (Job->Type == EJobType::HasSlot)
+				AsyncTask(ENamedThreads::GameThread, [Job, Result]()
 				{
-					EPersistenceHasResult Result;
-
-					switch (Exists)
+					if (UPersistenceManager* ThisPtr = Job->Manager.Get())
 					{
-					case ISaveGameSystem::ESaveExistsResult::OK:
-						Result = EPersistenceHasResult::Exists;
-						break;
-					case ISaveGameSystem::ESaveExistsResult::DoesNotExist:
-						Result = EPersistenceHasResult::Empty;
-						break;
-					case ISaveGameSystem::ESaveExistsResult::Corrupt:
-						Result = EPersistenceHasResult::Corrupt;
-						break;
-					case ISaveGameSystem::ESaveExistsResult::UnspecifiedError:
-					default:
-						Result = EPersistenceHasResult::Unknown;
-						break;
+						ThisPtr->HasSaveDone(*Job, Result);
 					}
+					FreeThreadJob(Job);
+				});
+			}
+			break;
 
-					AsyncTask(ENamedThreads::GameThread, [Job, Result]()
-					{
-						if (UPersistenceManager* ThisPtr = Job->Manager.Get())
-						{
-							ThisPtr->HasSaveDone(*Job, Result);
-						}
-						FreeThreadJob(Job);
-					});
+		case EJobType::LoadSlot:
+		case EJobType::LoadProfile:
+		case EJobType::ReadSlot:
+			{
+				const bool IsProfile = (Job->Type == EJobType::LoadProfile);
+				const FString SlotName = IsProfile ? SAVE_PROFILE_NAME : GetSlotName(Job->Slot);
+
+				EPersistenceHasResult ExistsResult;
+				DoesSaveGameExist(*SlotName, UserIndex, ExistsResult);
+
+				EPersistenceLoadResult Result;
+
+				if (ExistsResult == EPersistenceHasResult::Corrupt)
+				{
+					Result = EPersistenceLoadResult::Corrupt;
 				}
-				else
+				else if (ExistsResult == EPersistenceHasResult::Unknown)
 				{
-					EPersistenceLoadResult Result;
+					Result = EPersistenceLoadResult::Unknown;
+				}
+				else if (ExistsResult == EPersistenceHasResult::Empty)
+				{
+					Result = EPersistenceLoadResult::DoesNotExist;
+				}
+				else // Exists or Restored
+				{
+					TArray<uint8>& Data = IsProfile ? Job->ProfileData : Job->WorldData;
 
-					if (Exists == ISaveGameSystem::ESaveExistsResult::Corrupt)
+					LoadSaveGame(*SlotName, UserIndex, Data, Result);
+
+					if (Result == EPersistenceLoadResult::Success && ExistsResult == EPersistenceHasResult::Restored)
 					{
-						Result = EPersistenceLoadResult::Corrupt;
+						// The backup may have been restored in the DoesSaveGameExist() call above so be sure to take
+						// that into account.
+						Result = EPersistenceLoadResult::Restored;
 					}
-					else if (Exists == ISaveGameSystem::ESaveExistsResult::UnspecifiedError)
+				}
+
+				AsyncTask(ENamedThreads::GameThread, [Job, Result]()
+				{
+					bool JobDone = true;
+
+					if (UPersistenceManager* ThisPtr = Job->Manager.Get())
 					{
-						Result = EPersistenceLoadResult::Unknown;
-					}
-					else if (Exists == ISaveGameSystem::ESaveExistsResult::DoesNotExist)
-					{
-						Result = EPersistenceLoadResult::DoesNotExist;
-					}
-					else
-					{
-						TArray<uint8>& Data = IsProfile ? Job->ProfileData : Job->WorldData;
-						if (SaveSystem->LoadGame(false, *SlotName, UserIndex, Data))
+						if (Result == EPersistenceLoadResult::Success || Result == EPersistenceLoadResult::Restored)
 						{
-							if (DecompressData(Data))
+							const TArray<uint8>& Data = (Job->Type == EJobType::LoadProfile) ? Job->ProfileData : Job->WorldData;
+							if (ThisPtr->PreloadSave(*Job, Data))
 							{
-								Result = EPersistenceLoadResult::Success;
-							}
-							else
-							{
-								Result = EPersistenceLoadResult::Corrupt;
-							}
-						}
-						else
-						{
-							Result = EPersistenceLoadResult::Unknown;
-						}
-					}
-
-					AsyncTask(ENamedThreads::GameThread, [Job, Result]()
-					{
-						bool JobDone = true;
-
-						if (UPersistenceManager* ThisPtr = Job->Manager.Get())
-						{
-							if (Result == EPersistenceLoadResult::Success)
-							{
-								const TArray<uint8>& Data = (Job->Type == EJobType::LoadProfile) ? Job->ProfileData : Job->WorldData;
-								if (ThisPtr->PreloadSave(*Job, Data))
+								if (Job->AsyncLoad.IsValid())
 								{
-									if (Job->AsyncLoad.IsValid())
-									{
-										ThisPtr->QueuedJobs.Add(Job);
-										JobDone = false;
-									}
-								}
-							}
-
-							if (JobDone)
-							{
-								if (Job->Type == EJobType::LoadSlot)
-								{
-									ThisPtr->LoadSaveDone(*Job, Result);
-								}
-								else if (Job->Type == EJobType::LoadProfile)
-								{
-									ThisPtr->LoadProfileSaveDone(*Job, Result);
-								}
-								else if (Job->Type == EJobType::ReadSlot)
-								{
-									ThisPtr->ReadSaveDone(*Job, Result);
+									ThisPtr->QueuedJobs.Add(Job);
+									JobDone = false;
 								}
 							}
 						}
 
 						if (JobDone)
 						{
-							FreeThreadJob(Job);
+							if (Job->Type == EJobType::LoadSlot)
+							{
+								ThisPtr->LoadSaveDone(*Job, Result);
+							}
+							else if (Job->Type == EJobType::LoadProfile)
+							{
+								ThisPtr->LoadProfileSaveDone(*Job, Result);
+							}
+							else if (Job->Type == EJobType::ReadSlot)
+							{
+								ThisPtr->ReadSaveDone(*Job, Result);
+							}
 						}
-					});
-				}
+					}
+
+					if (JobDone)
+					{
+						FreeThreadJob(Job);
+					}
+				});
 			}
 			break;
 
@@ -2077,14 +1993,26 @@ uint32 UPersistenceManager::Run()
 		case EJobType::RestoreSlotBackup:
 		case EJobType::RestoreProfileBackup:
 			{
-				// TODO: No longer have backup/restore since it's not a native operation
-				// on any platform we support. If we want to reimplement it it would just
-				// need to be save slot rotation based.
-				AsyncTask(ENamedThreads::GameThread, [Job]()
+				bool Result;
+
+				const bool IsProfile = (Job->Type == EJobType::HasProfileBackup || Job->Type == EJobType::RestoreProfileBackup);
+				const bool IsRestore = (Job->Type == EJobType::RestoreProfileBackup || Job->Type == EJobType::RestoreSlotBackup);
+				const FString SlotName = IsProfile ? SAVE_PROFILE_NAME : GetSlotName(Job->Slot);
+
+				if (IsRestore)
+				{
+					Result = RestoreBackup(*SlotName);
+				}
+				else
+				{
+					Result = DoesBackupExist(*SlotName);
+				}
+
+				AsyncTask(ENamedThreads::GameThread, [Job, Result]()
 				{
 					if (UPersistenceManager* ThisPtr = Job->Manager.Get())
 					{
-						ThisPtr->BackupOperationDone(*Job, false);
+						ThisPtr->BackupOperationDone(*Job, Result);
 					}
 					FreeThreadJob(Job);
 				});
@@ -2098,6 +2026,96 @@ uint32 UPersistenceManager::Run()
 	}
 
 	return 0;
+}
+
+bool UPersistenceManager::DoesSaveGameExist(const FString& SlotName, const int32 UserIndex, EPersistenceHasResult& OutResult)
+{
+	ISaveGameSystem::ESaveExistsResult Exists;
+	bool bRestoredFromBackup = false;
+
+#if USE_WINDOWS_SAVEGAMESYSTEM
+	FWindowsSaveGameSystem& SaveSystem = FWindowsSaveGameSystem::Get();
+	Exists = SaveSystem.DoesSaveGameExistWithResult(*SlotName, UserIndex, bRestoredFromBackup);
+#else
+	ISaveGameSystem* SaveSystem = IPlatformFeaturesModule::Get().GetSaveGameSystem();
+	Exists = SaveSystem->DoesSaveGameExistWithResult(*SlotName, UserIndex);
+#endif
+
+	switch (Exists)
+	{
+	case ISaveGameSystem::ESaveExistsResult::OK:
+		OutResult = (bRestoredFromBackup) ? EPersistenceHasResult::Restored : EPersistenceHasResult::Exists;
+		return true;
+	case ISaveGameSystem::ESaveExistsResult::DoesNotExist:
+		OutResult = EPersistenceHasResult::Empty;
+		break;
+	case ISaveGameSystem::ESaveExistsResult::Corrupt:
+		OutResult = EPersistenceHasResult::Corrupt;
+		break;
+	case ISaveGameSystem::ESaveExistsResult::UnspecifiedError:
+	default:
+		OutResult = EPersistenceHasResult::Unknown;
+		break;
+	}
+
+	return false;
+}
+
+bool UPersistenceManager::LoadSaveGame(const FString& SlotName, const int32 UserIndex, TArray<uint8>& Data, EPersistenceLoadResult& OutResult)
+{
+	ISaveGameSystem* SaveSystem = IPlatformFeaturesModule::Get().GetSaveGameSystem();
+
+	bool bRestoredFromBackup = false;
+
+	do
+	{
+		if (SaveSystem->LoadGame(false, *SlotName, UserIndex, Data))
+		{
+			// We need to ensure the save data is readable. This will not check the objects in the save, only the
+			// header information and that the required save class is available.
+			if (VerifySaveIntegrity(Data, OutResult))
+			{
+				OutResult = (bRestoredFromBackup) ? EPersistenceLoadResult::Restored : EPersistenceLoadResult::Success;
+			}
+		}
+		else
+		{
+			OutResult = EPersistenceLoadResult::Unknown;
+		}
+
+		// We will potentially have backups so try to load them if our save is corrupt.
+		if (OutResult == EPersistenceLoadResult::Corrupt && RestoreBackup(SlotName))
+		{
+			bRestoredFromBackup = true;
+		}
+		else
+		{
+			break;
+		}
+	}
+	while(bRestoredFromBackup);
+
+	return (OutResult == EPersistenceLoadResult::Success || OutResult == EPersistenceLoadResult::Restored);
+}
+
+bool UPersistenceManager::DoesBackupExist(const FString& SlotName)
+{
+#if USE_WINDOWS_SAVEGAMESYSTEM
+	const FWindowsSaveGameSystem& SaveSystem = FWindowsSaveGameSystem::Get();
+	return SaveSystem.DoesBackupExist(*SlotName);
+#else
+	return false;
+#endif
+}
+
+bool UPersistenceManager::RestoreBackup(const FString& SlotName)
+{
+#if USE_WINDOWS_SAVEGAMESYSTEM
+	const FWindowsSaveGameSystem& SaveSystem = FWindowsSaveGameSystem::Get();
+	return SaveSystem.RestoreBackup(*SlotName);
+#else
+	return false;
+#endif
 }
 
 #if WITH_EDITOR
@@ -2115,8 +2133,8 @@ void UPersistenceManager::EditorInit()
 
 	if (!Settings->AllowEditorSaving)
 	{
-		// In PIE sessions try to delete any existing save data before starting play,
-		// to avoid old garbage messing things up.
+		// In PIE sessions try to delete any existing save data before starting play, to avoid old garbage messing
+		// things up.
 		SaveSystem->DeleteGame(false, SAVE_PROFILE_NAME, 0);
 
 		for (int32 i = 0; i < 8; ++i)
@@ -2133,10 +2151,8 @@ void UPersistenceManager::EditorInit()
 
 		if (Settings->AllowEditorSaving && SaveSystem->LoadGame(false, *GetSlotName(0), 0, ObjectBytes))
 		{
-			if (DecompressData(ObjectBytes))
-			{
-				CurrentData = Cast<USaveGameWorld>(ReadSave(ObjectBytes));
-			}
+			EPersistenceLoadResult Result;
+			CurrentData = Cast<USaveGameWorld>(ReadSave(ObjectBytes, Result));
 		}
 
 		if (CurrentData == nullptr)
@@ -2151,10 +2167,8 @@ void UPersistenceManager::EditorInit()
 		{
 			if (Settings->AllowEditorSaving && SaveSystem->LoadGame(false, SAVE_PROFILE_NAME, 0, ObjectBytes))
 			{
-				if (DecompressData(ObjectBytes))
-				{
-					UserProfile = Cast<USaveGameProfile>(ReadSave(ObjectBytes));
-				}
+				EPersistenceLoadResult Result;
+				UserProfile = Cast<USaveGameProfile>(ReadSave(ObjectBytes, Result));
 			}
 
 			if (UserProfile == nullptr)

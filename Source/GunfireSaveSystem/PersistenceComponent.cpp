@@ -12,7 +12,7 @@ UPersistenceComponent::UPersistenceComponent()
 	bWantsInitializeComponent = true;
 }
 
-inline bool UPersistenceComponent::IsPersistableObject(AActor* pObject) const
+inline bool UPersistenceComponent::CanPersistObject(AActor* pObject) const
 {
 	return (pObject != nullptr && !pObject->HasAnyFlags(RF_ClassDefaultObject | RF_ArchetypeObject)
 #if WITH_EDITOR
@@ -31,7 +31,7 @@ void UPersistenceComponent::PreSave(FObjectPreSaveContext SaveContext)
 
 	HasModifiedSaveValues = UPersistenceUtils::HasModifiedSaveProperties(GetOwner());
 
-	GeneratePersistentID();
+	GeneratePersistentId();
 }
 
 #endif
@@ -42,9 +42,8 @@ void UPersistenceComponent::InitializeComponent()
 
 	if (ShouldPersist())
 	{
-		// With rapid loading / unloading of levels. Actors can still be  
-		// initializing their components after the level unload delegate has fired.
-		// Their outer will be marked as pending kill, so bail out early if that is true.
+		// With rapid loading / unloading of levels actors can still be initializing their components after the level
+		// unload delegate has fired. Their outer will be marked as pending kill, so bail out early if that is true.
 		if (AActor* Parent = Cast<AActor>(GetOuter()))
 		{
 			if (Parent->IsPendingKillPending())
@@ -62,26 +61,25 @@ void UPersistenceComponent::InitializeComponent()
 		}
 
 		// If there isn't a valid persistent id this must be a dynamic spawn
-		if (!HasValidPersistentID())
+		if (!HasValidPersistentId())
 		{
 			IsDynamic = true;
 
-			// If the actor is being spawned by a save game being loaded its persistent id
-			// is cached in the container, so grab it from there.
+			// If the actor is being spawned by a save game being loaded its persistent id is cached in the container,
+			// so grab it from there.
 			if (Container)
 			{
-				UniqueID = Container->GetDynamicActorID();
+				UniqueId = Container->GetSpawningActorId();
 			}
 
-			// If we didn't find an id this must be the first spawn, go ahead and create
-			// one now.
-			if (UniqueID == INVALID_UID)
+			// If we didn't find an id this must be the first spawn, go ahead and create one now.
+			if (!UniqueId.IsValid())
 			{
-				GeneratePersistentID();
+				GeneratePersistentId();
 			}
 		}
 
-		if (HasValidPersistentID() && Container)
+		if (HasValidPersistentId() && Container)
 		{
 			// Attempt to load the saved data into the parent object
 			Container->LoadData(this, *Manager);
@@ -109,28 +107,25 @@ void UPersistenceComponent::BeginPlay()
 
 void UPersistenceComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-	if (ShouldPersist() && HasValidPersistentID()) 
+	if (ShouldPersist() && HasValidPersistentId()) 
 	{
 		if (UPersistenceManager* Manager = UPersistenceManager::GetInstance(this))
 		{
 			if ((EndPlayReason == EEndPlayReason::Destroyed) && PersistDestroyed)
 			{
-				// Don't need to do anything if a dynamic object is destroyed, next time
-				// the container is saved it'll be removed. We also ignore objects already
-				// being destroyed to avoid setting them as destroyed twice.
+				// Don't need to do anything if a dynamic object is destroyed, next time the container is saved it'll be
+				// removed. We also ignore objects already being destroyed to avoid setting them as destroyed twice.
 				if (!IsDynamic && !bHasBeenDestroyed)
 				{
-					// Because this is a static actor placed on the map in the editor,
-					// we can't just remove the actor data.  We actually have to mark
-					// that the actor has been destroyed, so upon map load the actor
-					// will be gracefully removed
+					// Because this is a static actor placed on the map in the editor, we can't just remove the actor
+					// data. We actually have to mark that the actor has been destroyed, so upon map load the actor will
+					// be gracefully removed
 					Manager->SetComponentDestroyed(this);
 				}
 			}
 			else if (!SaveKey.IsNone())
 			{
-				// If this container uses a save key it won't be auto-saved by the level
-				// unloading.  Force a save manually.
+				// If this container uses a save key it won't be auto-saved by the level unloading. Force a save manually.
 				Manager->WriteComponent(this);
 			}
 		}
@@ -145,7 +140,7 @@ void UPersistenceComponent::RegisterWithManager(bool bEnable)
 {
 	if (ShouldPersist())
 	{
-		if (HasValidPersistentID())
+		if (HasValidPersistentId())
 		{
 			if (UPersistenceManager* PersistenceManager = UPersistenceManager::GetInstance(this))
 			{
@@ -166,7 +161,7 @@ void UPersistenceComponent::RegisterWithManager(bool bEnable)
 	}
 }
 
-bool UPersistenceComponent::NeedsPersistentID() const
+bool UPersistenceComponent::NeedsPersistentId() const
 {
 #if WITH_EDITOR
 	if (GCompilingBlueprint)
@@ -175,8 +170,8 @@ bool UPersistenceComponent::NeedsPersistentID() const
 	}
 #endif
 
-	// Only generate a new ID if our current one is invalid
-	if (!HasValidPersistentID())
+	// Only generate a new id if our current one is invalid
+	if (!HasValidPersistentId())
 	{
 		if (GetWorld() == nullptr)
 		{
@@ -184,7 +179,7 @@ bool UPersistenceComponent::NeedsPersistentID() const
 			return false;
 		}
 
-		if (!IsPersistableObject(GetOwner()))
+		if (!CanPersistObject(GetOwner()))
 		{
 			// Invalid world/owner
 			return false;
@@ -201,11 +196,11 @@ void UPersistenceComponent::OnLevelChanged(ULevel* OldLevel)
 	UPersistenceManager::GetInstance(this)->OnLevelChanged(this, OldLevel);
 }
 
-void UPersistenceComponent::GeneratePersistentID()
+void UPersistenceComponent::GeneratePersistentId()
 {
-	if (NeedsPersistentID())
+	if (NeedsPersistentId())
 	{
-		UniqueID = UPersistenceManager::GeneratePID(GetComponentLevel());
+		UniqueId = FGuid::NewGuid();
 	}
 }
 

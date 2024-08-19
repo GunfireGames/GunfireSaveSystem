@@ -1,20 +1,18 @@
 #include "WindowsSaveGameSystem.h"
-#include "GunfireSaveSystem.h"
-
-#include "Misc/PathViews.h"
 
 #if USE_WINDOWS_SAVEGAMESYSTEM
+
+#include "HAL/FileManagerGeneric.h"
+#include "Misc/PathViews.h"
 
 #include "Windows/AllowWindowsPlatformTypes.h"
 #include <ShlObj.h>
 #include "Windows/HideWindowsPlatformTypes.h"
 
-#include "PlatformFeatures.h"
-
 FWindowsSaveGameSystem& FWindowsSaveGameSystem::Get()
 {
-	FGunfireSaveSystemModule& SaveSystem = FModuleManager::GetModuleChecked<FGunfireSaveSystemModule>("GunfireSaveSystem");
-	return SaveSystem.WindowsSaveGameSystem;
+	static FWindowsSaveGameSystem System;
+	return System;
 }
 
 FWindowsSaveGameSystem::FWindowsSaveGameSystem()
@@ -44,21 +42,6 @@ FWindowsSaveGameSystem::FWindowsSaveGameSystem()
 	{
 		SavedGamesDir = FString::Printf(TEXT("%sSaveGames"), *FPaths::ProjectSavedDir());
 	}
-
-	// Hook the callback so when there's no platform defined save game system and it
-	// falls back to the generic one it'll create ours instead.
-	CreateDefaultSaveGameSystem.BindLambda(
-		[&]()
-		{
-			return this;
-		});
-
-	// Now that we've bound our save game system creation callback, force the save
-	// game system to be instantiated so we can ensure that it's ours. If it isn't we
-	// need to move our callback registration earlier.
-	ISaveGameSystem* SaveSystem = IPlatformFeaturesModule::Get().GetSaveGameSystem();
-
-	ensureMsgf(SaveSystem == this, TEXT("We didn't override the save game system like we expected"));
 }
 
 void FWindowsSaveGameSystem::SetUserFolder(const FStringView& UserFolderIn)
@@ -72,12 +55,129 @@ void FWindowsSaveGameSystem::SetBackupSettings(int32 NumBackupsIn, double Backup
 	BackupIntervalSeconds = BackupIntervalSecondsIn;
 }
 
-bool FWindowsSaveGameSystem::SaveGame(bool bAttemptToUseUI, const TCHAR* Name, const int32 UserIndex, const TArray<uint8>& Data)
+bool FWindowsSaveGameSystem::DoesBackupExist(const TCHAR* Name) const
 {
-	const FString SavePath = GetSaveGamePath(Name);
+	TStringBuilder<MAX_PATH> SavePath, BackupPath;
+
+	GetSaveGamePath(Name, SavePath);
 	const FStringView BasePath = FPathViews::GetBaseFilenameWithPath(SavePath);
 
-	TStringBuilder<128> TempPath;
+	for (int32 i = 1; i <= NumBackups; ++i)
+	{
+		GetBackupSaveGamePath(BasePath, i, BackupPath);
+
+		const bool bBackupExists = IFileManager::Get().FileExists(*BackupPath);
+		if (bBackupExists)
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool FWindowsSaveGameSystem::RestoreBackup(const TCHAR* Name) const
+{
+	IPlatformFile& PlatformFile = IPlatformFile::GetPlatformPhysical();
+	TStringBuilder<MAX_PATH> SavePath, DestPath, SrcPath;
+
+	GetSaveGamePath(Name, SavePath);
+	const FStringView BasePath = FPathViews::GetBaseFilenameWithPath(SavePath);
+
+	// If we are restoring then something has gone wrong with the current save. Just rename it, prior to restoring a
+	// backup, to signify that it is corrupt. This way it can potentially be evaluated by the dev team later on.
+	if (PlatformFile.FileExists(*SavePath))
+	{
+		const FDateTime ModDateTime = FFileManagerGeneric::Get().GetTimeStamp(*SavePath);
+
+		DestPath.Appendf(TEXT("%s_%s.corrupt"), *SavePath, *ModDateTime.ToString());
+
+		PlatformFile.MoveFile(*DestPath, *SavePath);
+	}
+
+	// Keep track of our destination in case there are missing backups. For example, if bak1 is missing but bak2 and
+	// bak3 are available, this will ensure that bak2 becomes the main save and bak3 is put in the bak1 slot.
+	int32 DestRevision = 0;
+	bool bResult = false;
+
+	for (int32 i = 1; i <= NumBackups; ++i)
+	{
+		if (DestRevision == 0)
+		{
+			DestPath = SavePath.GetData();
+		}
+		else
+		{
+			GetBackupSaveGamePath(BasePath, DestRevision, DestPath);
+		}
+
+		GetBackupSaveGamePath(BasePath, i, SrcPath);
+
+		if (PlatformFile.FileExists(*SrcPath))
+		{
+			if (PlatformFile.FileExists(*DestPath))
+			{
+				PlatformFile.DeleteFile(*DestPath);
+			}
+
+			const bool bFileMoved = PlatformFile.MoveFile(*DestPath, *SrcPath);
+
+			// If we are overwriting the active save, store the result.
+			if (DestRevision == 0)
+			{
+				bResult = bFileMoved;
+			}
+
+			DestRevision++;
+		}
+	}
+
+	return bResult;
+}
+
+ISaveGameSystem::ESaveExistsResult FWindowsSaveGameSystem::DoesSaveGameExistWithResult(const TCHAR* Name, const int32 UserIndex, bool& bRestoredFromBackup)
+{
+	ESaveExistsResult Result;
+
+	bRestoredFromBackup = false;
+
+	do
+	{
+		Result = FGenericSaveGameSystem::DoesSaveGameExistWithResult(Name, UserIndex);
+
+		// If the save game is corrupt, attempt to restore a backup and try again.
+		if (Result == ESaveExistsResult::Corrupt && RestoreBackup(Name))
+		{
+			bRestoredFromBackup = true;
+		}
+		else
+		{
+			break;
+		}
+	}
+	while (bRestoredFromBackup);
+
+	// If we've successfully loaded a backup, mark the result as 'Restored'.
+	if (bRestoredFromBackup && Result == ESaveExistsResult::OK)
+	{
+		bRestoredFromBackup = true;
+	}
+
+	return Result;
+}
+
+ISaveGameSystem::ESaveExistsResult FWindowsSaveGameSystem::DoesSaveGameExistWithResult(const TCHAR* Name, const int32 UserIndex)
+{
+	bool bRestoredFromBackup;
+	return DoesSaveGameExistWithResult(Name, UserIndex, bRestoredFromBackup);
+}
+
+bool FWindowsSaveGameSystem::SaveGame(bool bAttemptToUseUI, const TCHAR* Name, const int32 UserIndex, const TArray<uint8>& Data)
+{
+	TStringBuilder<MAX_PATH> SavePath, TempPath;
+
+	GetSaveGamePath(Name, SavePath);
+	const FStringView BasePath = FPathViews::GetBaseFilenameWithPath(SavePath);
 	TempPath = BasePath;
 	TempPath.Append(TEXT(".tmp"));
 
@@ -133,23 +233,20 @@ void FWindowsSaveGameSystem::RotateBackups(const TCHAR* Name, const FStringView 
 	*LastTime = CurrentTime;
 
 	IPlatformFile& PlatformFile = IPlatformFile::GetPlatformPhysical();
+	TStringBuilder<MAX_PATH> CurrentBackupPath, NextBackupPath;
 
 	for (int32 i = NumBackups - 1; i >= 0; --i)
 	{
-		TStringBuilder<128> CurrentBackupPath, NextBackupPath;
-
 		if (i == 0)
 		{
 			CurrentBackupPath = SavePath;
 		}
 		else
 		{
-			CurrentBackupPath = BasePath;
-			CurrentBackupPath.Appendf(TEXT(".bak%d"), i);
+			GetBackupSaveGamePath(BasePath, i, CurrentBackupPath);	
 		}
 
-		NextBackupPath = BasePath;
-		NextBackupPath.Appendf(TEXT(".bak%d"), i + 1);
+		GetBackupSaveGamePath(BasePath, i + 1, NextBackupPath);
 
 		if (PlatformFile.FileExists(*CurrentBackupPath))
 		{
@@ -183,21 +280,34 @@ void FWindowsSaveGameSystem::RotateBackups(const TCHAR* Name, const FStringView 
 
 FString FWindowsSaveGameSystem::GetSaveGamePath(const TCHAR* Name)
 {
-	TStringBuilder<128> TempString;
+	TStringBuilder<MAX_PATH> TempString;
+	GetSaveGamePath(Name, TempString);
 
-	TempString.Append(SavedGamesDir);
-	TempString.AppendChar(TEXT('/'));
+	return TempString.ToString();
+}
+
+void FWindowsSaveGameSystem::GetSaveGamePath(const TCHAR* Name, TStringBuilderBase<TCHAR>& OutPath) const
+{
+	OutPath = SavedGamesDir;
+	OutPath.AppendChar(TEXT('/'));
 
 	if (UserFolder.Len() > 0)
 	{
-		TempString.Append(UserFolder);
-		TempString.AppendChar(TEXT('/'));
+		OutPath.Append(UserFolder);
+		OutPath.AppendChar(TEXT('/'));
 	}
 
-	TempString.Append(Name);
-	TempString.Append(TEXT(".sav"));
+	OutPath.Append(Name);
+	OutPath.Append(TEXT(".sav"));
+}
 
-	return TempString.ToString();
+void FWindowsSaveGameSystem::GetBackupSaveGamePath(const FStringView BasePath, int32 Revision, TStringBuilderBase<TCHAR>& OutPath) const
+{
+	if (NumBackups > 0)
+	{
+		OutPath = BasePath;
+		OutPath.Appendf(TEXT(".bak%d"), Revision);
+	}
 }
 
 #endif // USE_WINDOWS_SAVEGAMESYSTEM

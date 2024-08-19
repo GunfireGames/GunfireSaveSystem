@@ -6,7 +6,6 @@ public class GunfireSaveSystem : ModuleRules
 {
 	public GunfireSaveSystem(ReadOnlyTargetRules Target) : base(Target)
 	{
-		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
 		bAllowConfidentialPlatformDefines = true;
 
 		PublicDependencyModuleNames.AddRange(

@@ -1,15 +1,14 @@
 // Copyright Gunfire Games, LLC. All Rights Reserved.
 
 #include "PersistenceContainer.h"
+
 #include "PersistenceComponent.h"
 #include "PersistenceManager.h"
 #include "PersistenceUtils.h"
-#include "SaveGameArchive.h"
 
 #include "Engine/AssetManager.h"
 #include "Engine/World.h"
 #include "Kismet/GameplayStatics.h"
-#include "Serialization/LargeMemoryReader.h"
 #include "Serialization/MemoryReader.h"
 #include "Serialization/MemoryWriter.h"
 #include "UObject/Package.h"
@@ -19,17 +18,12 @@
 DECLARE_CYCLE_STAT(TEXT("Container WriteData"), STAT_PersistenceGunfire_ContainerWriteData, STATGROUP_Persistence);
 DECLARE_CYCLE_STAT(TEXT("Container Unpack"), STAT_PersistenceGunfire_ContainerUnpack, STATGROUP_Persistence);
 
-// This version is for backwards compatible changes.  Non backwards compatible changes
-// should just bump GUNFIRE_PERSISTENCE_VERSION and invalidate all old savegames.
+// This version is for backwards compatible changes. Non backwards compatible changes should just bump
+// GUNFIRE_PERSISTENCE_VERSION and invalidate all old savegames.
 //
 // Version History
-// 1: Initial version
-// 2: Removed UniqueName field
-// 3: Switched to FTopLevelAssetPath for dynamic actor references
-// 4: Got rid of UE4 version
-#define CONTAINER_VERSION 4
-
-//////////////////////////////////////////////////////////////////////////////////////////
+// 1: Reset due to GUNFIRE_PERSISTENCE_VERSION bump
+#define CONTAINER_VERSION 1
 
 struct FSubArchive : public FArchiveProxy
 {
@@ -57,67 +51,105 @@ struct FSubArchive : public FArchiveProxy
 	int64 Offset;
 };
 
-//////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-UPersistenceContainer::UPersistenceContainer()
-	: SpawningActorID(UPersistenceComponent::INVALID_UID)
+void UPersistenceContainer::FHeader::Reset()
 {
+	Version = CONTAINER_VERSION;
+	UEVersion = GPackageFileUEVersion;
+	IndexOffset = 0;
+	DynamicOffset = 0;
+
+	Info.Reset();
+	Destroyed.Reset();
+	CustomVersions.Empty();
+	NameCache.Reset();
 }
+
+void UPersistenceContainer::FHeader::Serialize(FArchive& Ar)
+{
+	Ar << Version;
+	Ar << UEVersion;
+	Ar << DynamicOffset;
+	Ar << IndexOffset;
+
+	if (Ar.IsLoading())
+	{
+		const int64 DataStartOffset = Ar.Tell();
+
+		Ar.Seek(IndexOffset);
+
+		SerializeVariable(Ar);
+
+		Ar.Seek(DataStartOffset);
+	}
+}
+
+void UPersistenceContainer::FHeader::SerializeVariable(FArchive& Ar)
+{
+	if (Ar.IsSaving())
+	{
+		IndexOffset = Ar.Tell();
+	}
+
+	// Serialize the index for actors we wrote
+	uint32 NumInfos = Info.Num();
+	Ar << NumInfos;
+	Info.SetNum(NumInfos);
+
+	for (FInfo& CurInfo : Info)
+	{
+		Ar << CurInfo.UniqueId;
+		Ar << CurInfo.Offset;
+		Ar << CurInfo.Length;
+	}
+
+	// Serialize the destroyed actor ids
+	uint32 NumDestroyed = Destroyed.Num();
+	Ar << NumDestroyed;
+	Destroyed.SetNum(NumDestroyed);
+
+	for (FGuid& DestroyedId : Destroyed)
+	{
+		Ar << DestroyedId;
+	}
+
+	// Serialize the custom versions for any objects we wrote
+	if (Ar.IsSaving())
+	{
+		CustomVersions = Ar.GetCustomVersions();
+	}
+	CustomVersions.Serialize(Ar);
+
+	// Serialize the cache of unique FNames for all objects in this container
+	NameCache.Serialize(Ar);
+}
+
+void UPersistenceContainer::FHeader::InitArchive(FArchive& Ar) const
+{
+	Ar.SetUEVer(UEVersion);
+	Ar.SetCustomVersions(CustomVersions);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void UPersistenceContainer::Pack()
 {
-	Info.Reset();
-	Destroyed.Reset();
+	Header.Reset();
 	LoadState = EClassLoadState::Uninitialized;
 }
 
 void UPersistenceContainer::Unpack()
 {
 	// Shouldn't be calling unpack if we're already unpacked
-	ensure(Info.Num() == 0 && Destroyed.Num() == 0);
+	ensure(IsPacked());
 
-	Info.Reset();
-	Destroyed.Reset();
+	Header.Reset();
 
-	if (Blob.Data.Num() == 0)
+	if (Blob.Data.Num() > 0)
 	{
-		return;
-	}
-
-	FMemoryReader Ar(Blob.Data, true);
-
-	FHeader Header = ReadHeader(Ar);
-
-	Ar.Seek(Header.IndexOffset);
-
-	uint32 NumInfos;
-	Ar << NumInfos;
-	Info.SetNumUninitialized(NumInfos);
-
-	for (FInfo& CurInfo : Info)
-	{
-		Ar << CurInfo.UniqueID;
-		if (Header.Version < 2)
-		{
-			FName Unused;
-			Ar << Unused;
-		}
-		Ar << CurInfo.Offset;
-		Ar << CurInfo.Length;
-	}
-
-	uint32 NumDestroyed;
-	Ar << NumDestroyed;
-	Destroyed.SetNumUninitialized(NumDestroyed);
-
-	for (uint64& DestroyedID : Destroyed)
-	{
-		Ar << DestroyedID;
-		if (Header.Version < 2)
-		{
-			FName Unused;
-			Ar << Unused;
-		}
+		FMemoryReader Ar(Blob.Data, true);
+		Header.Serialize(Ar);
 	}
 }
 
@@ -129,14 +161,12 @@ void UPersistenceContainer::WriteData(TArrayView<TWeakObjectPtr<UPersistenceComp
 	UE_LOG(LogGunfireSaveSystem, Verbose, TEXT("Writing persistence container '%s' (%s)"), *Key.ToString(), *GetName());
 
 	Blob.Data.Reset();
-	Info.Reset();
 
 	FMemoryWriter Ar(Blob.Data, true);
 
 	// Stub in the header for data we don't calculate until the end, we'll rewrite it later
-	FHeader Header;
-	Header.Version = CONTAINER_VERSION;
-	WriteHeader(Ar, Header);
+	Header.Reset();
+	Header.Serialize(Ar);
 
 	int32 NumDynamicActors = 0;
 
@@ -152,20 +182,19 @@ void UPersistenceContainer::WriteData(TArrayView<TWeakObjectPtr<UPersistenceComp
 				NumDynamicActors++;
 			}
 
-			FInfo& ThisInfo = Info[Info.AddUninitialized()];
-			ThisInfo.UniqueID = RawComponent->UniqueID;
-			ThisInfo.Offset = (uint32)Ar.Tell();
+			FInfo& ThisInfo = Header.Info[Header.Info.AddUninitialized()];
+			ThisInfo.UniqueId = RawComponent->UniqueId;
+			ThisInfo.Offset = static_cast<uint32>(Ar.Tell());
 
 			{
-				// When we read the component back in we'll give it an archive with just
-				// its data, so wrap the output archive in a subarchive to ensure any
-				// offsets written are correct when read back in.
+				// When we read the component back in we'll give it an archive with just its data, so wrap the output
+				// archive in a subarchive to ensure any offsets written are correct when read back in.
 				FSubArchive SubAr(Ar);
 				WriteData(RawComponent, Manager, SubAr);
 			}
 
 			// Calculate the total size of the save data for this actor
-			ThisInfo.Length = (uint32)Ar.Tell() - ThisInfo.Offset;
+			ThisInfo.Length = static_cast<uint32>(Ar.Tell()) - ThisInfo.Offset;
 		}
 	}
 
@@ -186,7 +215,7 @@ void UPersistenceContainer::WriteData(TArrayView<TWeakObjectPtr<UPersistenceComp
 			{
 				UE_LOG(LogGunfireSaveSystem, VeryVerbose, TEXT("Dynamic actor '%s'"), *Actor->GetName());
 
-				Ar << RawComponent->UniqueID;
+				Ar << RawComponent->UniqueId;
 
 				FTransform Transform = Actor->GetTransform();
 
@@ -201,33 +230,12 @@ void UPersistenceContainer::WriteData(TArrayView<TWeakObjectPtr<UPersistenceComp
 		}
 	}
 
-	//
-	// Write the index and destroyed actors
-	//
-	Header.IndexOffset = Ar.Tell();
+	// Write out all the variable size header data at the end
+	Header.SerializeVariable(Ar);
 
-	uint32 NumInfos = Info.Num();
-	Ar << NumInfos;
-
-	for (FInfo& CurInfo : Info)
-	{
-		Ar << CurInfo.UniqueID;
-		Ar << CurInfo.Offset;
-		Ar << CurInfo.Length;
-	}
-
-	uint32 NumDestroyed = Destroyed.Num();
-	Ar << NumDestroyed;
-
-	for (uint64& DestroyedID : Destroyed)
-	{
-		Ar << DestroyedID;
-	}
-
-	//
 	// Write the final offsets
-	//
-	WriteHeader(Ar, Header);
+	Ar.Seek(0);
+	Header.Serialize(Ar);
 }
 
 void UPersistenceContainer::PreloadDynamicActors(ULevel* Level, UPersistenceManager& Manager)
@@ -258,8 +266,7 @@ bool UPersistenceContainer::HasSpawnedDynamicActors() const
 
 bool UPersistenceContainer::SpawnDynamicActors(ULevel* Level, UPersistenceManager& Manager)
 {
-	// If we already finished the load (or everything was already loaded), spawn the
-	// dynamic actors now.
+	// If we already finished the load (or everything was already loaded), spawn the dynamic actors now.
 	if (LoadState == EClassLoadState::SpawningDynamicActors)
 	{
 		SpawnDynamicActorsInternal(Level, Manager, true);
@@ -268,9 +275,9 @@ bool UPersistenceContainer::SpawnDynamicActors(ULevel* Level, UPersistenceManage
 
 		return true;
 	}
-	// If we're still preloading, switch to a state where the dynamic actors will be
-	// spawned as soon as the load is done.
-	else if (LoadState == EClassLoadState::Preloading)
+
+	// If we're still preloading, switch to a state where the dynamic actors will be spawned as soon as the load is done.
+	if (LoadState == EClassLoadState::Preloading)
 	{
 		UE_LOG(LogGunfireSaveSystem, Log, TEXT("Level finished loading before dynamic actors for container '%s' were loaded, delaying spawn"), *Key.ToString());
 
@@ -284,7 +291,8 @@ void UPersistenceContainer::SpawnDynamicActorsInternal(ULevel* Level, UPersisten
 {
 	FMemoryReader Ar(Blob.Data, true);
 
-	FHeader Header = ReadHeader(Ar);
+	ensure(Header.IsUnpacked());
+	Header.InitArchive(Ar);
 
 	Ar.Seek(Header.DynamicOffset);
 
@@ -297,8 +305,8 @@ void UPersistenceContainer::SpawnDynamicActorsInternal(ULevel* Level, UPersisten
 
 	for (int32 i = 0; i < NumDynamicActors; i++)
 	{
-		uint64 UniqueID;
-		Ar << UniqueID;
+		FGuid UniqueId;
+		Ar << UniqueId;
 
 		FTransform Transform;
 		Ar << Transform;
@@ -307,17 +315,7 @@ void UPersistenceContainer::SpawnDynamicActorsInternal(ULevel* Level, UPersisten
 		Manager.AddLevelOffset(Level, Transform);
 
 		FTopLevelAssetPath ClassPath;
-
-		if (Header.Version >= 3)
-		{
-			Ar << ClassPath;
-		}
-		else
-		{
-			FString OldClassPath;
-			Ar << OldClassPath;
-			ClassPath.TrySetPath(OldClassPath);
-		}
+		Ar << ClassPath;
 
 		if (!Spawn)
 		{
@@ -336,21 +334,21 @@ void UPersistenceContainer::SpawnDynamicActorsInternal(ULevel* Level, UPersisten
 				SpawnInfo.Instigator = nullptr;
 				SpawnInfo.bDeferConstruction = true;
 
-				// Make sure the actor spawns a a part of the level
+				// Make sure the actor spawns into the correct level
 				SpawnInfo.OverrideLevel = Level;
 
 				if (AActor* Actor = Cast<AActor>(Level->GetWorld()->SpawnActor(ClassInfo, &Transform, SpawnInfo)))
 				{
-					// Cache off the unique id and finish spawning the actor.  It will call
-					// back into the persistence container to find the id when it initializes.
-					SpawningActorID = UniqueID;
+					// Cache off the unique id and finish spawning the actor. It will call back into the persistence
+					// container to find the id when it initializes.
+					SpawningActorId = UniqueId;
 
 					UGameplayStatics::FinishSpawningActor(Actor, Transform);
 
-					// Spawned actor didn't take the persistent id.  Did something go wrong?
-					ensure(SpawningActorID == UPersistenceComponent::INVALID_UID);
+					// Spawned actor didn't take the persistent id. Did something go wrong?
+					ensure(!SpawningActorId.IsValid());
 
-					SpawningActorID = UPersistenceComponent::INVALID_UID;
+					SpawningActorId.Invalidate();
 				}
 			}
 		}
@@ -358,9 +356,8 @@ void UPersistenceContainer::SpawnDynamicActorsInternal(ULevel* Level, UPersisten
 
 	if (!Spawn)
 	{
-		// Always request all the necessary classes, even if they're already loaded.
-		// That way we'll have a ref on them so they won't be garbage collected if they
-		// are already loaded and get all their refs dropped.
+		// Always request all the necessary classes, even if they're already loaded. That way we'll have a ref on them,
+		// so they won't be garbage collected if they are already loaded and get all their refs dropped.
 		if (ClassesToLoad.Num() > 0)
 		{
 			UE_LOG(LogGunfireSaveSystem, Log, TEXT("Requesting load of dynamic actor classes for container '%s'"), *Key.ToString());
@@ -407,66 +404,42 @@ void UPersistenceContainer::OnDynamicActorsLoaded(ULevel* Level)
 	}
 }
 
-uint64 UPersistenceContainer::GetDynamicActorID()
+FGuid UPersistenceContainer::GetSpawningActorId()
 {
-	uint64 Ret = SpawningActorID;
-	SpawningActorID = UPersistenceComponent::INVALID_UID;
+	const FGuid Ret = SpawningActorId;
+	SpawningActorId.Invalidate();
 	return Ret;
 }
 
 void UPersistenceContainer::SetDestroyed(UPersistenceComponent* Component)
 {
-	ensureMsgf(!Destroyed.Contains(Component->UniqueID), TEXT("Adding destroyed actor twice"));
+	ensureMsgf(!Header.Destroyed.Contains(Component->UniqueId), TEXT("Adding destroyed actor twice"));
 
-	Destroyed.Emplace(Component->UniqueID);
+	Header.Destroyed.Emplace(Component->UniqueId);
 }
 
 void UPersistenceContainer::LoadData(UPersistenceComponent* Component, UPersistenceManager& Manager) const
 {
-	// If this goes off we're somehow loading data when this container hasn't been
-	// unpacked.  Was the level load missed somehow?
-	ensure(Blob.Data.Num() == 0 || Info.Num() > 0 || Destroyed.Num() > 0);
+	// If this goes off we're somehow loading data when this container hasn't been unpacked. Was the level load missed
+	// somehow?
+	ensure(Blob.Data.Num() == 0 || Header.IsUnpacked());
 
-	const FInfo* ActorInfo = Info.FindByPredicate([=](const FInfo& RHS) { return Component->UniqueID == RHS.UniqueID; });
+	const FInfo* ActorInfo = Header.Info.FindByPredicate([=](const FInfo& RHS) { return Component->UniqueId == RHS.UniqueId; });
 
-	// If we found saved info for this actor, create a reader for that section of the raw
-	// data and read it in.
+	// If we found saved info for this actor, create a reader for that section of the raw data and read it in.
 	if (ActorInfo)
 	{
-		FLargeMemoryReader Ar(&Blob.Data[ActorInfo->Offset], ActorInfo->Length);
+		FMemoryReaderView Ar(FMemoryView(&Blob.Data[ActorInfo->Offset], ActorInfo->Length));
+		Header.InitArchive(Ar);
 		ReadData(Component, Manager, Ar);
 	}
 	// Otherwise, check if it's been marked as destroyed
-	else if (Destroyed.Contains(Component->UniqueID))
+	else if (Header.Destroyed.Contains(Component->UniqueId))
 	{
+		UE_LOG(LogGunfireSaveSystem, Verbose, TEXT("UPersistenceContainer - Attempted load for persistently destroyed actor '%s'"), *(Component->GetOwner()->GetActorNameOrLabel()));
+
 		Component->DestroyPersistentActor();
 	}
-}
-
-void UPersistenceContainer::WriteHeader(FArchive& Ar, FHeader Header) const
-{
-	Ar.Seek(0);
-
-	Ar << Header.Version;
-	Ar << Header.IndexOffset;
-	Ar << Header.DynamicOffset;
-}
-
-UPersistenceContainer::FHeader UPersistenceContainer::ReadHeader(FArchive& Ar) const
-{
-	Ar.Seek(0);
-
-	FHeader Header;
-	Ar << Header.Version;
-	if (Header.Version < 4)
-	{
-		int32 UE4Version;
-		Ar << UE4Version;
-	}
-	Ar << Header.IndexOffset;
-	Ar << Header.DynamicOffset;
-
-	return Header;
 }
 
 void UPersistenceContainer::WriteData(UPersistenceComponent* Component, UPersistenceManager& Manager, FArchive& Ar)
@@ -488,7 +461,8 @@ void UPersistenceContainer::WriteData(UPersistenceComponent* Component, UPersist
 
 	// Write Actor Data.
 	{
-		FSaveGameArchive PAr(Ar, Component->HasModifiedSaveValues);
+		FSaveGameArchive PAr(Ar, &Header.NameCache);
+		PAr.SetNoDelta(Component->HasModifiedSaveValues);
 		PAr.WriteBaseObject(Actor, Manager.GetClassCache());
 	}
 }
@@ -518,7 +492,7 @@ void UPersistenceContainer::ReadData(UPersistenceComponent* Component, UPersiste
 
 	// Read Actor Data
 	{
-		FSaveGameArchive PAr(Ar);
+		FSaveGameArchive PAr(Ar, const_cast<FNameCache*>(&Header.NameCache));
 		PAr.ReadBaseObject(Actor);
 	}
 }
